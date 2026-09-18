@@ -39,6 +39,15 @@ jobs:
           $version = (python -c "from version import APP_VERSION; print(APP_VERSION)").Trim()
           & "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" "/DMyAppVersion=$version" installer.iss
           if (!(Test-Path "dist-installer/TOMS-SLA-MB.exe")) { throw "Installer was not created" }
+          $testDir = Join-Path $env:RUNNER_TEMP "TOMS-SLA-MB-installed"
+          $readyFile = Join-Path $env:RUNNER_TEMP "TOMS-SLA-MB-installer-ready.txt"
+          $env:TOMS_UPDATE_READY_FILE = $readyFile
+          $install = Start-Process -FilePath "dist-installer/TOMS-SLA-MB.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$testDir","/MERGETASKS=!desktopicon" -PassThru -Wait
+          Remove-Item Env:TOMS_UPDATE_READY_FILE
+          if ($install.ExitCode -ne 0) { throw "Installer self-test failed with exit code $($install.ExitCode)" }
+          if (!(Test-Path $readyFile)) { throw "Installer did not create the readiness signal" }
+          & "$testDir/TOMS-SLA-MB.exe" --browser-self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed Playwright/Chromium self-test failed" }
       - name: Create SHA-256
         id: version
         shell: pwsh
