@@ -33,6 +33,8 @@ def _windows_read(service, account):
         ctypes.POINTER(ctypes.POINTER(CREDENTIAL)),
     ]
     advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    advapi32.CredFree.restype = None
     if not advapi32.CredReadW(service, 1, 0, ctypes.byref(pointer)):
         return ""
     try:
