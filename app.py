@@ -28,9 +28,11 @@ except ImportError:  # pragma: no cover - friendly message at runtime
     TargetClosedError = RuntimeError
 
 import TXL_Monitor_Tele_Group_All_Over10 as txl
+import credential_store
+import github_diagnostics
 import updater
 from config import APP_DATA_ENV, APP_NAME, APP_SLUG, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV, UNIT_LABEL
-from version import APP_VERSION, UPDATE_CHECK_INTERVAL_SECONDS
+from version import APP_VERSION, DIAGNOSTICS_REPOSITORY, UPDATE_CHECK_INTERVAL_SECONDS
 
 
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +65,7 @@ ONEBSS_URL = "https://onebss.vnpt.vn/"
 INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
 MAX_EXCEL_RECOVERY_ATTEMPTS = 1
 DIAGNOSTICS_DIRNAME = "diagnostics"
+DIAGNOSTICS_CREDENTIAL_SERVICE = f"{APP_SLUG}/github-diagnostics"
 
 
 def _load_settings():
@@ -185,6 +188,12 @@ class ATSApp(tk.Tk):
         )
         saved_recipients = _load_recipient_chat_ids(saved.get("error_recipient_chat_ids", []))
         self.error_recipient_chat_ids = tk.StringVar(value=", ".join(saved_recipients))
+        self.github_diagnostics_token = tk.StringVar(
+            value=os.getenv("TOMS_SLA_GITHUB_DIAGNOSTICS_TOKEN", "")
+            or credential_store.load_secret(
+                DIAGNOSTICS_CREDENTIAL_SERVICE, DIAGNOSTICS_REPOSITORY
+            )
+        )
         self._error_recipient_ids = saved_recipients
         self._telegram_token_for_alerts = self.telegram_token.get().strip()
         self.current_stage = "Khởi tạo ứng dụng"
@@ -240,15 +249,25 @@ class ATSApp(tk.Tk):
             box,
             text="Có thể nhập nhiều Chat ID, cách nhau bằng dấu phẩy. Để trống nếu không nhận cảnh báo lỗi.",
         ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
-        ttk.Label(box, text=f"Cấu hình Telegram được lưu riêng trên máy này: {SETTINGS_PATH}").grid(row=4, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+        ttk.Label(box, text="GitHub token chẩn đoán").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Entry(box, textvariable=self.github_diagnostics_token, show="*").grid(row=4, column=1, columnspan=2, sticky="ew", **pad)
+        self.github_token_btn = ttk.Button(box, text="Lưu và kiểm tra", command=self._save_github_token)
+        self.github_token_btn.grid(row=4, column=3, sticky="ew", **pad)
+        ttk.Label(box, text=f"Gói lỗi tự tải lên repository private: {DIAGNOSTICS_REPOSITORY}").grid(row=5, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+        ttk.Label(box, text=f"Cấu hình Telegram được lưu riêng trên máy này: {SETTINGS_PATH}").grid(row=6, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
         box.columnconfigure(1, weight=1)
         box.columnconfigure(2, weight=1)
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(actions, text="1. Mở Chrome / OneBSS", command=self.open_browser)
+        self.start_btn = ttk.Button(actions, text="1. Đăng nhập OneBSS", command=self.open_browser)
         self.start_btn.pack(side="left", padx=4)
-        self.run_btn = ttk.Button(actions, text="2. Chạy quy trình", command=self.run_workflow)
+        self.run_btn = ttk.Button(
+            actions,
+            text="2. Cấu hình và chạy",
+            command=self.run_workflow,
+            state="disabled",
+        )
         self.run_btn.pack(side="left", padx=4)
         ttk.Button(actions, text="Dừng", command=self.request_stop).pack(side="left", padx=4)
         ttk.Checkbutton(actions, text="Tự động cảnh báo sau", variable=self.schedule_enabled).pack(side="left", padx=(12, 4))
@@ -290,6 +309,30 @@ class ATSApp(tk.Tk):
         self.log.insert("end", f"{time.strftime('%H:%M:%S')}  {text}\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _save_github_token(self):
+        token = self.github_diagnostics_token.get().strip()
+        if not token:
+            messagebox.showerror("Thiếu GitHub token", "Hãy nhập fine-grained GitHub token.")
+            return
+        self.github_token_btn.configure(state="disabled")
+        self.write_log("Đang kiểm tra quyền tải chẩn đoán lên GitHub...")
+        threading.Thread(target=self._save_github_token_worker, args=(token,), daemon=True).start()
+
+    def _save_github_token_worker(self, token):
+        try:
+            github_diagnostics.verify_access(DIAGNOSTICS_REPOSITORY, token)
+            credential_store.save_secret(
+                DIAGNOSTICS_CREDENTIAL_SERVICE, DIAGNOSTICS_REPOSITORY, token
+            )
+            self.write_log("Đã lưu GitHub token an toàn trong kho thông tin xác thực của hệ điều hành.")
+            self.after(0, lambda: messagebox.showinfo("GitHub chẩn đoán", "Token hợp lệ và đã được lưu an toàn."))
+        except Exception as exc:
+            error_text = str(exc)
+            self.write_log(f"Không lưu được GitHub token: {error_text}")
+            self.after(0, lambda error_text=error_text: messagebox.showerror("GitHub chẩn đoán", error_text))
+        finally:
+            self.after(0, lambda: self.github_token_btn.configure(state="normal"))
 
     def _on_close(self):
         """Release the temporary no-sleep request before the UI exits."""
@@ -514,7 +557,7 @@ class ATSApp(tk.Tk):
         self.progress.stop()
         self.update_btn.configure(state="normal")
         self.start_btn.configure(state="normal")
-        self.run_btn.configure(state="normal")
+        self.run_btn.configure(state="disabled")
         self.write_log(f"Cập nhật thất bại: {error_text}")
         messagebox.showerror(f"Cập nhật {APP_NAME}", error_text)
 
@@ -561,6 +604,8 @@ class ATSApp(tk.Tk):
             return
         self.stop_requested = False
         self.start_event = threading.Event()
+        self.start_btn.configure(state="disabled")
+        self.run_btn.configure(state="disabled")
         self._acquire_keep_awake()
         self.worker = threading.Thread(target=self._session_workflow, daemon=True)
         self.worker.start()
@@ -576,7 +621,8 @@ class ATSApp(tk.Tk):
             if self.start_event:
                 if not self._apply_telegram_config():
                     return
-                self.write_log("Bắt đầu quy trình tự động...")
+                self.run_btn.configure(state="disabled")
+                self.write_log("Bắt đầu bước 2: cấu hình OneBSS và chạy quy trình...")
                 self.start_event.set()
             return
         self.write_log("Hãy bấm nút 1 để mở Chrome trước.")
@@ -845,6 +891,24 @@ class ATSApp(tk.Tk):
         if failures:
             self.write_log(f"Có {len(failures)} người nhận cảnh báo lỗi không thành công.")
 
+    def _upload_last_diagnostic(self):
+        folder = self._last_diagnostic_path
+        token = self.github_diagnostics_token.get().strip()
+        if not folder or not token:
+            if folder and not token:
+                self.write_log("Chưa cấu hình GitHub token; gói chẩn đoán chỉ được lưu trên máy.")
+            return ""
+        try:
+            self.write_log("Đang nén và tải một gói chẩn đoán lên GitHub private...")
+            url = github_diagnostics.upload_diagnostic(
+                folder, DIAGNOSTICS_REPOSITORY, token, APP_SLUG
+            )
+            self.write_log(f"Đã tải gói chẩn đoán lên GitHub: {url}")
+            return url
+        except Exception as exc:
+            self.write_log(f"Không tải được gói chẩn đoán lên GitHub: {exc}")
+            return ""
+
     @staticmethod
     def _safe_page_url(page):
         try:
@@ -1050,18 +1114,25 @@ class ATSApp(tk.Tk):
                 self.browser_context, self.browser_page = ctx, page
                 self.current_stage = "Mở OneBSS"
                 page.goto(ONEBSS_URL, wait_until="domcontentloaded")
-                self.write_log("Chrome đã mở. Hãy đăng nhập OneBSS; chương trình sẽ tự mở trang kiểm soát.")
+                self.write_log(
+                    "Bước 1: Chrome đã mở. Hãy đăng nhập OneBSS; "
+                    "chương trình sẽ giữ nguyên website sau khi đăng nhập."
+                )
                 self.current_stage = "Chờ người dùng đăng nhập OneBSS"
                 self._wait_for_login(page)
                 self._save_browser_storage_state(ctx)
-                self.current_stage = "Mở màn hình và cấu hình bộ lọc OneBSS"
-                self._navigate_onebss(page)
-                self._save_browser_storage_state(ctx)
-                self.write_log("Đã vào trang Kiểm soát tồn báo hỏng CNTT. Kiểm tra cấu hình rồi bấm nút 2.")
+                self.write_log(
+                    "Đăng nhập thành công. Website không bị làm mới; "
+                    "hãy bấm nút 2 để cấu hình và chạy."
+                )
+                self.after(0, lambda: self.run_btn.configure(state="normal"))
                 self.current_stage = "Chờ bắt đầu quy trình"
                 self.start_event.wait()
                 if self.stop_requested:
                     return
+                self.current_stage = "Mở màn hình và cấu hình bộ lọc OneBSS"
+                self._navigate_onebss(page)
+                self._save_browser_storage_state(ctx)
                 self.after(0, lambda: self.progress.start(10))
                 cycle = 1
                 while not self.stop_requested:
@@ -1094,6 +1165,9 @@ class ATSApp(tk.Tk):
             error_text = str(exc)
             if self._last_diagnostic_path:
                 error_text += f"\nGói chẩn đoán: {self._last_diagnostic_path}"
+                diagnostic_url = self._upload_last_diagnostic()
+                if diagnostic_url:
+                    error_text += f"\nGitHub chẩn đoán: {diagnostic_url}"
             if not self.stop_requested:
                 self._send_workflow_error_alert(error_text)
             self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
@@ -1101,6 +1175,8 @@ class ATSApp(tk.Tk):
             self.current_stage = "Đã dừng"
             self.after(0, self.progress.stop)
             self.after(0, self._release_keep_awake)
+            self.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.after(0, lambda: self.run_btn.configure(state="disabled"))
 
     def _wait_for_login(self, page):
         for _ in range(180):
