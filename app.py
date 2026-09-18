@@ -52,6 +52,7 @@ def _app_data_dir():
 APP_DATA = _app_data_dir()
 SETTINGS_PATH = APP_DATA / "settings.json"
 IN_PROGRESS_ALERT_STATE_PATH = APP_DATA / "in_progress_alert_state.json"
+STORAGE_STATE_PATH = APP_DATA / "onebss-storage-state.json"
 if getattr(sys, "frozen", False):
     PROFILE = APP_DATA / "chrome-profile"
     DOWNLOADS = Path.home() / "Downloads" / APP_SLUG
@@ -1052,8 +1053,10 @@ class ATSApp(tk.Tk):
                 self.write_log("Chrome đã mở. Hãy đăng nhập OneBSS; chương trình sẽ tự mở trang kiểm soát.")
                 self.current_stage = "Chờ người dùng đăng nhập OneBSS"
                 self._wait_for_login(page)
+                self._save_browser_storage_state(ctx)
                 self.current_stage = "Mở màn hình và cấu hình bộ lọc OneBSS"
                 self._navigate_onebss(page)
+                self._save_browser_storage_state(ctx)
                 self.write_log("Đã vào trang Kiểm soát tồn báo hỏng CNTT. Kiểm tra cấu hình rồi bấm nút 2.")
                 self.current_stage = "Chờ bắt đầu quy trình"
                 self.start_event.wait()
@@ -1084,7 +1087,7 @@ class ATSApp(tk.Tk):
                             break
                         time.sleep(1)
                     cycle += 1
-                ctx.close()
+                self._close_browser_context(ctx)
                 self.browser_context, self.browser_page = None, None
         except Exception as exc:
             self.write_log(f"LỖI: {exc}")
@@ -1140,25 +1143,72 @@ class ATSApp(tk.Tk):
         browser_channel=None,
         use_configured_channel=True,
     ):
-        """Launch the Playwright-matched browser instead of system Chrome.
+        """Launch an ephemeral context and restore the saved OneBSS session.
 
-        The installed Google Chrome channel can be newer than the Playwright
-        driver and has crashed during OneBSS downloads on macOS. Playwright's
-        bundled Chromium is version-matched and is therefore the safe default.
-        Set ATS_BROWSER_CHANNEL=chrome only when explicitly needed.
+        Reusing a persistent Chromium profile can crash Chromium/Chrome when a
+        download starts on Windows. Cookies and local storage are persisted via
+        Playwright storage state instead, while every browser process receives
+        a fresh profile.
         """
-        options = {
+        launch_options = {
             "headless": headless,
+        }
+        context_options = {
             "accept_downloads": True,
             "viewport": {"width": 1440, "height": 900},
         }
-        Path(profile).mkdir(parents=True, exist_ok=True)
         if browser_channel is None and use_configured_channel:
             browser_channel = os.getenv("ATS_BROWSER_CHANNEL", "").strip() or None
         if browser_channel:
-            options["channel"] = browser_channel
+            launch_options["channel"] = browser_channel
+        if STORAGE_STATE_PATH.is_file():
+            context_options["storage_state"] = str(STORAGE_STATE_PATH)
         self.browser_backend = browser_channel or "playwright-chromium"
-        return playwright.chromium.launch_persistent_context(str(profile), **options)
+        browser = playwright.chromium.launch(**launch_options)
+        try:
+            return browser.new_context(**context_options)
+        except Exception:
+            if "storage_state" not in context_options:
+                browser.close()
+                raise
+            self.write_log(
+                "Trạng thái đăng nhập OneBSS đã lưu không còn hợp lệ; "
+                "đang mở phiên sạch để đăng nhập lại."
+            )
+            context_options.pop("storage_state", None)
+            try:
+                return browser.new_context(**context_options)
+            except Exception:
+                browser.close()
+                raise
+
+    @staticmethod
+    def _close_browser_context(context):
+        browser = None
+        try:
+            browser = context.browser
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            if browser and browser.is_connected():
+                browser.close()
+        except Exception:
+            pass
+
+    def _save_browser_storage_state(self, context):
+        """Persist authentication without reusing the crash-prone profile."""
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        temporary = STORAGE_STATE_PATH.with_suffix(".tmp")
+        context.storage_state(path=str(temporary))
+        os.replace(temporary, STORAGE_STATE_PATH)
+        try:
+            STORAGE_STATE_PATH.chmod(0o600)
+        except OSError:
+            pass
 
     def _navigate_onebss(self, page):
         menu_name = "Kiểm soát viên - Kiểm soát tồn báo hỏng CNTT"
@@ -1391,15 +1441,12 @@ class ATSApp(tk.Tk):
             f"Đang mở lại và cấu hình lại (lần {recovery_attempt}/"
             f"{MAX_EXCEL_RECOVERY_ATTEMPTS})..."
         )
-        try:
-            context.close()
-        except Exception:
-            pass
+        self._close_browser_context(context)
 
         # A repeated Export failure can be specific to Playwright Chromium.
         # On macOS use the installed stable Google Chrome first; on Windows,
-        # try Chrome then Edge. All candidates reuse the automation profile
-        # so an active OneBSS session is retained.
+        # try Chrome then Edge. Every candidate gets a fresh browser profile
+        # and restores the saved OneBSS authentication state.
         if sys.platform == "win32":
             channels = ("chrome", "msedge", None)
         elif sys.platform == "darwin":
@@ -1425,6 +1472,7 @@ class ATSApp(tk.Tk):
                 self._ensure_onebss_session_active(new_page)
                 self._navigate_onebss(new_page)
                 self._ensure_onebss_session_active(new_page)
+                self._save_browser_storage_state(new_context)
                 self.write_log(
                     f"Đã mở lại OneBSS bằng {backend} và cấu hình xong; "
                     "chạy lại tìm kiếm và xuất Excel."
@@ -1435,7 +1483,7 @@ class ATSApp(tk.Tk):
                 self.write_log(f"Không mở được OneBSS bằng {backend}: {exc}")
                 try:
                     if new_context:
-                        new_context.close()
+                        self._close_browser_context(new_context)
                 except Exception:
                     pass
         raise RuntimeError(f"Không thể khởi chạy lại OneBSS sau lỗi browser: {last_error}")
@@ -1446,6 +1494,7 @@ class ATSApp(tk.Tk):
         while True:
             self.current_stage = f"Chu kỳ {cycle}: cập nhật ngày và bộ lọc"
             self._refresh_cycle_dates(page)
+            self._save_browser_storage_state(context)
             self.current_stage = f"Chu kỳ {cycle}: tìm kiếm và xuất Excel"
             try:
                 return context, page, self._export_excel(page, context)
