@@ -189,53 +189,36 @@ def _powershell_quote(value):
 
 
 def build_replacement_script(process_id, current_exe, new_exe, log_path):
-    """Build the PowerShell script that swaps the EXE after this process exits."""
+    """Build a helper that installs the onedir update after this process exits."""
     current = _powershell_quote(Path(current_exe).resolve())
     new = _powershell_quote(Path(new_exe).resolve())
-    backup = _powershell_quote(Path(str(Path(current_exe).resolve()) + ".old"))
     log = _powershell_quote(Path(log_path).resolve())
     return f"""$ErrorActionPreference = 'Stop'
 $processId = {int(process_id)}
 $currentExe = {current}
-$newExe = {new}
-$backupExe = {backup}
+$installer = {new}
 $logFile = {log}
 $readyFile = Join-Path (Split-Path -Parent $logFile) 'update-ready.txt'
 try {{
     Wait-Process -Id $processId -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 500
-    if (Test-Path -LiteralPath $backupExe) {{ Remove-Item -LiteralPath $backupExe -Force }}
-    Move-Item -LiteralPath $currentExe -Destination $backupExe -Force
-    Move-Item -LiteralPath $newExe -Destination $currentExe -Force
-    $started = $false
-    for ($attempt = 1; $attempt -le 3; $attempt++) {{
-        Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
-        $env:TOMS_UPDATE_READY_FILE = $readyFile
-        $newProcess = Start-Process -FilePath $currentExe -PassThru
-        $deadline = (Get-Date).AddSeconds(20)
-        while ((Get-Date) -lt $deadline) {{
-            if (Test-Path -LiteralPath $readyFile) {{ $started = $true; break }}
-            if ($newProcess.HasExited) {{ break }}
-            Start-Sleep -Milliseconds 500
-        }}
-        if ($started) {{ break }}
-        if (-not $newProcess.HasExited) {{ Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue }}
-        Add-Content -LiteralPath $logFile -Value ((Get-Date).ToString('s') + " lan khoi dong $attempt that bai")
-        Start-Sleep -Seconds 3
+    $install = Start-Process -FilePath $installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -PassThru -Wait
+    if ($install.ExitCode -ne 0) {{ throw "Bo cai tra ve ma loi $($install.ExitCode)" }}
+    Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
+    $env:TOMS_UPDATE_READY_FILE = $readyFile
+    $newProcess = Start-Process -FilePath $currentExe -PassThru
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {{
+        if (Test-Path -LiteralPath $readyFile) {{ break }}
+        if ($newProcess.HasExited) {{ throw 'Ung dung thoat truoc khi san sang' }}
+        Start-Sleep -Milliseconds 500
     }}
+    if (-not (Test-Path -LiteralPath $readyFile)) {{ throw 'Ung dung khong tao tin hieu san sang' }}
     Remove-Item Env:TOMS_UPDATE_READY_FILE -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
-    if (-not $started) {{ throw 'Ban cap nhat khong tao duoc tin hieu san sang sau 3 lan' }}
-    if (Test-Path -LiteralPath $backupExe) {{ Remove-Item -LiteralPath $backupExe -Force }}
+    Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
 }} catch {{
     $failure = $_.Exception.Message
-    try {{
-        if (Test-Path -LiteralPath $backupExe) {{
-            if (Test-Path -LiteralPath $currentExe) {{ Remove-Item -LiteralPath $currentExe -Force }}
-            Move-Item -LiteralPath $backupExe -Destination $currentExe -Force
-            Start-Process -FilePath $currentExe
-        }}
-    }} catch {{}}
+    try {{ if (Test-Path -LiteralPath $currentExe) {{ Start-Process -FilePath $currentExe }} }} catch {{}}
     Add-Content -LiteralPath $logFile -Value ((Get-Date).ToString('s') + ' ' + $failure)
 }}
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
@@ -243,7 +226,7 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 
 
 def launch_windows_replacement(new_exe, work_dir, repository=None):
-    """Start a detached helper that replaces and relaunches the frozen EXE."""
+    """Start a detached helper that runs the signed-style onedir installer."""
     if not can_self_update(repository):
         raise UpdateError("Tự thay EXE chỉ hoạt động trên bản đóng gói Windows")
 
@@ -253,11 +236,6 @@ def launch_windows_replacement(new_exe, work_dir, repository=None):
         raise UpdateError("Không tìm thấy EXE cập nhật đã tải xuống")
     if new_exe == current_exe:
         raise UpdateError("EXE cập nhật trùng với ứng dụng đang chạy")
-    if not os.access(current_exe.parent, os.W_OK):
-        raise UpdateError(
-            "Thư mục chứa ATS-TXL.exe không cho phép ghi. "
-            "Hãy chuyển EXE sang thư mục của người dùng."
-        )
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     script_path = work_dir / "install-update.ps1"

@@ -1053,13 +1053,14 @@ class ATSApp(tk.Tk):
         if sys.platform != "win32":
             return "Không áp dụng: không phải Windows."
         command = (
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new();"
             "$since=(Get-Date).AddMinutes(-10);"
             "$events=Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=$since} "
             "-ErrorAction SilentlyContinue | Where-Object {"
             "$_.ProviderName -match 'Application Error|Windows Error Reporting' -or "
             "$_.Message -match 'chrome|chromium|msedge|ATS-TXL'"
             "} | Select-Object TimeCreated,ProviderName,Id,LevelDisplayName,Message;"
-            "$events | ConvertTo-Json -Depth 3"
+            "$events | ConvertTo-Json -Depth 3 -Compress"
         )
         try:
             result = subprocess.run(
@@ -1154,6 +1155,7 @@ class ATSApp(tk.Tk):
                 raise RuntimeError("Thiếu Playwright. Hãy cài requirements.txt trước.")
             DOWNLOADS.mkdir(exist_ok=True)
             with sync_playwright() as p:
+                self.current_stage = "Khởi chạy Chromium"
                 ctx = self._launch_browser_context(p)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 self.browser_context, self.browser_page = ctx, page
@@ -1729,6 +1731,19 @@ if __name__ == "__main__":
     # EXE can load Python, Playwright and the application's imports without
     # opening a GUI or requiring OneBSS/Telegram configuration.
     if "--self-test" in sys.argv:
+        raise SystemExit(0)
+    if "--browser-self-test" in sys.argv:
+        if sync_playwright is None:
+            raise SystemExit("Playwright unavailable")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_content("<title>TOMS SLA browser self-test</title>")
+            if page.title() != "TOMS SLA browser self-test":
+                raise SystemExit("Chromium self-test failed")
+            context.close()
+            browser.close()
         raise SystemExit(0)
     app = ATSApp()
     ready_file = os.getenv("TOMS_UPDATE_READY_FILE", "").strip()

@@ -73,28 +73,38 @@ set "PLAYWRIGHT_BROWSERS_PATH=0"
 echo Dang cai Chromium tuong thich voi Playwright...
 python -m playwright install chromium
 if errorlevel 1 goto :failed
-echo Dang dong goi TOMS-SLA-MB.exe (file co the lon vi kem ca Chromium)...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all playwright --name TOMS-SLA-MB app.py
+echo Dang dong goi thu muc ung dung on dinh...
+python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all playwright --name TOMS-SLA-MB app.py
 if errorlevel 1 goto :failed
 
-if not exist "dist\TOMS-SLA-MB.exe" (
-    echo [LOI] PyInstaller khong tao ra dist\TOMS-SLA-MB.exe
+if not exist "dist\TOMS-SLA-MB\TOMS-SLA-MB.exe" (
+    echo [LOI] PyInstaller khong tao ra ung dung onedir
     goto :failed
 )
 
-echo Dang tao ma kiem tra SHA-256...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -Algorithm SHA256 -LiteralPath 'dist\TOMS-SLA-MB.exe').Hash.ToLower(); Set-Content -LiteralPath 'dist\TOMS-SLA-MB.exe.sha256' -Value ($hash + '  TOMS-SLA-MB.exe') -Encoding ascii"
+"dist\TOMS-SLA-MB\TOMS-SLA-MB.exe" --browser-self-test
 if errorlevel 1 goto :failed
-if not exist "dist\TOMS-SLA-MB.exe.sha256" (
+set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" (
+    echo [LOI] Chua cai Inno Setup 6. Hay cai Inno Setup roi chay lai.
+    goto :failed
+)
+"%ISCC%" /DMyAppVersion=%APP_VERSION% installer.iss
+if errorlevel 1 goto :failed
+
+echo Dang tao ma kiem tra SHA-256...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$hash=(Get-FileHash -Algorithm SHA256 -LiteralPath 'dist-installer\TOMS-SLA-MB.exe').Hash.ToLower(); Set-Content -LiteralPath 'dist-installer\TOMS-SLA-MB.exe.sha256' -Value ($hash + '  TOMS-SLA-MB.exe') -Encoding ascii"
+if errorlevel 1 goto :failed
+if not exist "dist-installer\TOMS-SLA-MB.exe.sha256" (
     echo [LOI] Khong tao duoc dist\ATS-TXL.exe.sha256
     goto :failed
 )
 
 echo.
 echo [THANH CONG] Cac file da tao cho phien ban %APP_VERSION%:
-echo %CD%\dist\TOMS-SLA-MB.exe
-echo %CD%\dist\TOMS-SLA-MB.exe.sha256
-echo Chi can chep file TOMS-SLA-MB.exe sang may Windows dich lan dau.
+echo %CD%\dist-installer\TOMS-SLA-MB.exe
+echo %CD%\dist-installer\TOMS-SLA-MB.exe.sha256
+echo Chi can chep va chay bo cai TOMS-SLA-MB.exe tren may Windows dich.
 echo De phat hanh cap nhat, chay publish_windows_release.bat.
 echo Khong can MonitorTXL-1.exe, Python, Chrome hay extension rieng.
 echo.
