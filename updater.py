@@ -200,15 +200,32 @@ $currentExe = {current}
 $newExe = {new}
 $backupExe = {backup}
 $logFile = {log}
+$readyFile = Join-Path (Split-Path -Parent $logFile) 'update-ready.txt'
 try {{
     Wait-Process -Id $processId -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
     if (Test-Path -LiteralPath $backupExe) {{ Remove-Item -LiteralPath $backupExe -Force }}
     Move-Item -LiteralPath $currentExe -Destination $backupExe -Force
     Move-Item -LiteralPath $newExe -Destination $currentExe -Force
-    $newProcess = Start-Process -FilePath $currentExe -PassThru
-    Start-Sleep -Seconds 10
-    if ($newProcess.HasExited) {{ throw 'Ban cap nhat khong khoi dong on dinh' }}
+    $started = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {{
+        Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
+        $env:TOMS_UPDATE_READY_FILE = $readyFile
+        $newProcess = Start-Process -FilePath $currentExe -PassThru
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {{
+            if (Test-Path -LiteralPath $readyFile) {{ $started = $true; break }}
+            if ($newProcess.HasExited) {{ break }}
+            Start-Sleep -Milliseconds 500
+        }}
+        if ($started) {{ break }}
+        if (-not $newProcess.HasExited) {{ Stop-Process -Id $newProcess.Id -Force -ErrorAction SilentlyContinue }}
+        Add-Content -LiteralPath $logFile -Value ((Get-Date).ToString('s') + " lan khoi dong $attempt that bai")
+        Start-Sleep -Seconds 3
+    }}
+    Remove-Item Env:TOMS_UPDATE_READY_FILE -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
+    if (-not $started) {{ throw 'Ban cap nhat khong tao duoc tin hieu san sang sau 3 lan' }}
     if (Test-Path -LiteralPath $backupExe) {{ Remove-Item -LiteralPath $backupExe -Force }}
 }} catch {{
     $failure = $_.Exception.Message

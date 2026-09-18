@@ -621,11 +621,37 @@ class ATSApp(tk.Tk):
             if self.start_event:
                 if not self._apply_telegram_config():
                     return
+                if not self._validate_telegram_group():
+                    return
                 self.run_btn.configure(state="disabled")
                 self.write_log("Bắt đầu bước 2: cấu hình OneBSS và chạy quy trình...")
                 self.start_event.set()
             return
         self.write_log("Hãy bấm nút 1 để mở Chrome trước.")
+
+    def _validate_telegram_group(self):
+        token = self.telegram_token.get().strip()
+        chat_id = self.telegram_chat_id.get().strip()
+        try:
+            response = requests.get(
+                f"https://api.telegram.org/bot{token}/getChat",
+                params={"chat_id": chat_id},
+                timeout=15,
+            )
+            payload = response.json()
+            if not response.ok or not payload.get("ok"):
+                description = payload.get("description") or f"HTTP {response.status_code}"
+                if "chat not found" in description.lower():
+                    raise RuntimeError(
+                        f"Không tìm thấy Group chat ID {chat_id}. Hãy kiểm tra lại ID "
+                        "và thêm bot Telegram vào đúng nhóm trước khi chạy."
+                    )
+                raise RuntimeError(f"Không kiểm tra được nhóm Telegram: {description}")
+            return True
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            self.write_log(f"Cấu hình Telegram chưa hợp lệ: {exc}")
+            messagebox.showerror("Kiểm tra Telegram", str(exc))
+            return False
 
     def _apply_telegram_config(self):
         token = self.telegram_token.get().strip()
@@ -1102,6 +1128,25 @@ class ATSApp(tk.Tk):
         self.write_log(f"Đã lưu gói chẩn đoán Export: {folder}")
         return folder
 
+    def _create_workflow_diagnostic(self, exc):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        folder = APP_DATA / DIAGNOSTICS_DIRNAME / f"workflow_{timestamp}_{uuid.uuid4().hex[:10]}"
+        folder.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "host": socket.gethostname(),
+            "operating_system": f"{platform.system()} {platform.release()}",
+            "stage": self.current_stage,
+            "error": str(exc),
+        }
+        (folder / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        (folder / "windows-events.json").write_text(self._windows_crash_events(), encoding="utf-8")
+        self._last_diagnostic_path = folder
+        self.write_log(f"Đã lưu gói chẩn đoán Workflow: {folder}")
+        return folder
+
     def _session_workflow(self):
         try:
             self.current_stage = "Khởi tạo Playwright và Chromium"
@@ -1163,6 +1208,8 @@ class ATSApp(tk.Tk):
         except Exception as exc:
             self.write_log(f"LỖI: {exc}")
             error_text = str(exc)
+            if not self._last_diagnostic_path:
+                self._create_workflow_diagnostic(exc)
             if self._last_diagnostic_path:
                 error_text += f"\nGói chẩn đoán: {self._last_diagnostic_path}"
                 diagnostic_url = self._upload_last_diagnostic()
@@ -1170,7 +1217,7 @@ class ATSApp(tk.Tk):
                     error_text += f"\nGitHub chẩn đoán: {diagnostic_url}"
             if not self.stop_requested:
                 self._send_workflow_error_alert(error_text)
-            self.after(0, lambda error_text=error_text: messagebox.showerror("ATS TXL", error_text))
+            self.after(0, lambda error_text=error_text: messagebox.showerror(APP_NAME, error_text))
         finally:
             self.current_stage = "Đã dừng"
             self.after(0, self.progress.stop)
@@ -1683,4 +1730,13 @@ if __name__ == "__main__":
     # opening a GUI or requiring OneBSS/Telegram configuration.
     if "--self-test" in sys.argv:
         raise SystemExit(0)
-    ATSApp().mainloop()
+    app = ATSApp()
+    ready_file = os.getenv("TOMS_UPDATE_READY_FILE", "").strip()
+    if ready_file:
+        try:
+            ready_path = Path(ready_file)
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            ready_path.write_text(str(os.getpid()), encoding="ascii")
+        except OSError:
+            pass
+    app.mainloop()
