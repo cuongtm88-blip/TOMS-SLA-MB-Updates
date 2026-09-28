@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import calendar
 import html
 import os
 import platform
@@ -14,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import requests
 
@@ -31,7 +32,10 @@ import TXL_Monitor_Tele_Group_All_Over10 as txl
 import credential_store
 import github_diagnostics
 import updater
-from config import APP_DATA_ENV, APP_NAME, APP_SLUG, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV, UNIT_LABEL
+import duty_roster
+import onebss_grid
+import remote_login
+from config import APP_DATA_ENV, APP_NAME, APP_SLUG, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
 from version import APP_VERSION, DIAGNOSTICS_REPOSITORY, UPDATE_CHECK_INTERVAL_SECONDS
 
 
@@ -66,6 +70,52 @@ INCIDENT_INVENTORY_URL = ONEBSS_URL + "#/htkh/ManagementIncidentInventory?tag=2"
 MAX_EXCEL_RECOVERY_ATTEMPTS = 1
 DIAGNOSTICS_DIRNAME = "diagnostics"
 DIAGNOSTICS_CREDENTIAL_SERVICE = f"{APP_SLUG}/github-diagnostics"
+ONEBSS_CREDENTIAL_SERVICE = f"{APP_SLUG}/onebss-login"
+ROSTER_PATH = APP_DATA / "duty_rosters.json"
+CONTACTS_PATH = APP_DATA / "duty_contacts.json"
+SEARCH_SCOPES = (
+    (("Phòng HTKH Miền Bắc (VIP 1)", "Phòng HTKH Miền Nam (VIP 2)",
+      "Phòng HTKH Miền Trung (VIP 3)"),
+     ("Tập trung", "Miền Bắc", "Miền Trung", "Miền Nam")),
+)
+MB_PROVINCES = {
+    duty_roster.normalize(name) for name in (
+        "Bắc Giang", "Bắc Kạn", "Bắc Ninh", "Cao Bằng", "Điện Biên",
+        "Hà Giang", "Hà Nam", "Hà Nội", "Hải Dương", "Hải Phòng",
+        "Hòa Bình", "Hưng Yên", "Lai Châu", "Lạng Sơn", "Lào Cai",
+        "Nam Định", "Ninh Bình", "Phú Thọ", "Quảng Ninh", "Sơn La",
+        "Thái Bình", "Thái Nguyên", "Tuyên Quang", "Vĩnh Phúc", "Yên Bái",
+    )
+}
+
+
+def split_mb_ticket_scopes(frame, contacts):
+    """Split tickets into MB staff and remaining tickets installed in MB."""
+    required = {"ten_nv", "tentinh", "diachi_ld"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise RuntimeError("Bảng OneBSS thiếu cột phân loại MB: " + ", ".join(sorted(missing)))
+    if not contacts:
+        raise RuntimeError("Chưa import danh sách tên nhân sự và ID chat Telegram để lọc phiếu MB")
+
+    contact_names = {duty_roster.normalize(name) for name in contacts}
+    staff_mask = frame["ten_nv"].fillna("").map(duty_roster.normalize).isin(contact_names)
+
+    def is_mb_province(value):
+        place = duty_roster.normalize(value)
+        place = re.sub(r"^(?:tỉnh|thành phố|tp\.?|thị xã)\s+", "", place)
+        return place in MB_PROVINCES
+
+    def is_mb_installation(row):
+        if is_mb_province(row.get("tentinh", "")):
+            return True
+        address = duty_roster.normalize(row.get("diachi_ld", ""))
+        return any(province in address for province in MB_PROVINCES)
+
+    location_mask = frame.apply(is_mb_installation, axis=1)
+    mb_staff = frame[staff_mask].copy()
+    mb_installation = frame[location_mask & ~staff_mask].copy()
+    return mb_staff.reset_index(drop=True), mb_installation.reset_index(drop=True)
 
 
 def _load_settings():
@@ -107,13 +157,15 @@ def _in_progress_alert_key(row):
     return "\x1f".join((str(row.get("ma_bh", "")).strip(), str(row.get("ngay_bh", "")).strip()))
 
 
-def _get_new_in_progress_alerts(frame):
+def _get_new_in_progress_alerts(frame, recipient=None):
     """Keep only tickets that reached an unsent 60-minute alert milestone."""
     state = _load_in_progress_alert_state()
     indexes = []
     milestones = {}
     for index, row in frame.iterrows():
         key = _in_progress_alert_key(row)
+        if recipient is not None:
+            key = str(recipient) + "\x1e" + key
         current = int(row["alert_round"])
         try:
             previous = int(state.get(key, 0))
@@ -162,6 +214,14 @@ def _load_recipient_chat_ids(value):
         return []
 
 
+def _parse_repeat_minutes(value):
+    try:
+        minutes = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return minutes if 1 <= minutes <= 10080 else None
+
+
 class ATSApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -172,9 +232,10 @@ class ATSApp(tk.Tk):
         self.worker = None
         self.stop_requested = False
         self.auto_repeat = bool(saved.get("schedule_enabled", True))
-        self.repeat_seconds = 30 * 60
         self.schedule_enabled = tk.BooleanVar(value=self.auto_repeat)
-        self.repeat_minutes = tk.StringVar(value=str(saved.get("repeat_minutes", 5)))
+        saved_repeat_minutes = _parse_repeat_minutes(saved.get("repeat_minutes", 5)) or 5
+        self.repeat_seconds = saved_repeat_minutes * 60
+        self.repeat_minutes = tk.StringVar(value=str(saved_repeat_minutes))
         self.keep_awake_enabled = tk.BooleanVar(
             value=bool(saved.get("keep_awake_enabled", False))
         )
@@ -206,6 +267,17 @@ class ATSApp(tk.Tk):
         self._last_diagnostic_path = None
         self.start_event = None
         self.update_in_progress = False
+        self.macos_preview = sys.platform == "darwin"
+        self.mb_extended = True
+        self.destination = tk.StringVar(value=saved.get("alert_destination", "Group"))
+        self.onebss_user = tk.StringVar(value=saved.get("onebss_user", ""))
+        self.onebss_password = tk.StringVar(value="")
+        self.remote_enabled = tk.BooleanVar(value=saved.get("remote_login_enabled", False))
+        self.otp_chat_ids = tk.StringVar(value=saved.get("otp_chat_ids", ""))
+        self.otp_selector = tk.StringVar(value=saved.get("otp_selector", 'input[placeholder="Mã OTP"]'))
+        self._remote_config = None
+        self._alert_destination = self.destination.get()
+        self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if updater.can_self_update():
@@ -258,6 +330,17 @@ class ATSApp(tk.Tk):
         box.columnconfigure(1, weight=1)
         box.columnconfigure(2, weight=1)
 
+        if self.mb_extended:
+            preview = ttk.Frame(self)
+            preview.pack(fill="x", padx=12)
+            ttk.Label(
+                preview,
+                text=("MB — đọc bảng OneBSS, không tải Excel" if self.macos_preview
+                      else "MB — lọc nhân sự/địa chỉ, cảnh báo theo nhóm")
+            ).pack(side="left")
+            ttk.Button(preview, text="OneBSS / OTP / Lịch trực", command=self._preview_settings).pack(side="right")
+            ttk.Combobox(preview, textvariable=self.destination, values=("Group", "Nhân sự trong ca", "Cả hai"), state="readonly", width=18).pack(side="right", padx=8)
+
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
         self.start_btn = ttk.Button(actions, text="1. Đăng nhập OneBSS", command=self.open_browser)
@@ -287,6 +370,345 @@ class ATSApp(tk.Tk):
         self.log = tk.Text(log_frame, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
         self.write_log("Sẵn sàng. Hãy mở Chrome và đăng nhập OneBSS.")
+
+    def _prepare_preview_config(self):
+        try:
+            self._alert_destination = self.destination.get()
+            if self._alert_destination not in ("Group", "Nhân sự trong ca", "Cả hai"):
+                raise ValueError("Chọn nơi nhận cảnh báo")
+            if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
+                duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
+            user = self.onebss_user.get().strip()
+            password = self.onebss_password.get()
+            allowed = _parse_recipient_chat_ids(self.otp_chat_ids.get())
+            if self.remote_enabled.get():
+                if not user or not allowed or any(v.startswith("-") or v == "0" for v in allowed):
+                    raise ValueError("Đăng nhập từ xa cần user và Chat ID cá nhân nhận OTP")
+                if password:
+                    credential_store.save_secret(ONEBSS_CREDENTIAL_SERVICE, user, password)
+                    self.onebss_password.set("")
+                password = password or credential_store.load_secret(ONEBSS_CREDENTIAL_SERVICE, user)
+                if not password:
+                    raise ValueError("Hãy nhập mật khẩu OneBSS (lưu trong Keychain)")
+                if not self.telegram_token.get().strip() or not self.otp_selector.get().strip():
+                    raise ValueError("Thiếu Telegram Bot token hoặc selector ô OTP")
+                self._remote_config = (user, password, allowed, self.otp_selector.get().strip())
+            else:
+                self._remote_config = None
+            settings = _load_settings()
+            settings.update(onebss_user=user, remote_login_enabled=self.remote_enabled.get(),
+                            otp_chat_ids=self.otp_chat_ids.get(), otp_selector=self.otp_selector.get(),
+                            alert_destination=self._alert_destination)
+            _save_settings(settings)
+            return True
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            # Keychain command errors can contain the supplied secret in argv.
+            detail = str(exc) if isinstance(exc, ValueError) else "Không lưu được vào Keychain/cấu hình"
+            messagebox.showerror("Thiết lập MB", detail)
+            return False
+
+    def _preview_settings(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Thiết lập", "Hãy dừng quy trình trước khi thay đổi tài khoản hoặc lịch trực.")
+            return
+        window = tk.Toplevel(self)
+        window.title("MB — OneBSS, OTP và lịch trực")
+        window.geometry(f"{min(1200, self.winfo_screenwidth() - 80)}x{min(720, self.winfo_screenheight() - 100)}")
+        auth = ttk.LabelFrame(window, text="Đăng nhập lại OneBSS — không lưu mật khẩu/OTP trong chẩn đoán")
+        auth.pack(fill="x", padx=10, pady=8)
+        ttk.Checkbutton(auth, text="Tự động đăng nhập lại qua OTP Telegram", variable=self.remote_enabled).grid(row=0, column=0, columnspan=4, sticky="w")
+        for index, (label, var, masked) in enumerate((
+            ("User OneBSS", self.onebss_user, False),
+            ("Mật khẩu (để trống dùng Keychain)", self.onebss_password, True),
+            ("Chat ID cá nhân được phép gửi OTP", self.otp_chat_ids, False),
+            ("Selector OTP (chỉ đổi khi OneBSS đổi UI)", self.otp_selector, False),
+        ), 1):
+            ttk.Label(auth, text=label).grid(row=index, column=0, sticky="w", padx=6, pady=3)
+            ttk.Entry(auth, textvariable=var, show="*" if masked else "", width=65).grid(row=index, column=1, columnspan=3, sticky="ew", padx=6)
+        ttk.Button(auth, text="Lưu thiết lập", command=self._prepare_preview_config).grid(row=5, column=3, pady=5)
+        auth.columnconfigure(1, weight=1)
+        tools = ttk.Frame(window)
+        tools.pack(fill="x", padx=10, pady=5)
+        ttk.Label(tools, text="Tháng YYYY-MM").pack(side="left")
+        ttk.Entry(tools, textvariable=self.roster_month, width=10).pack(side="left", padx=5)
+        table = ttk.Frame(window)
+        table.pack(fill="both", expand=True, padx=10)
+        table.columnconfigure(1, weight=1)
+        table.rowconfigure(0, weight=1)
+        style = ttk.Style(window)
+        style.configure("DutyRoster.Treeview", rowheight=30)
+        names = ttk.Treeview(table, columns=("telegram",), show="tree headings", selectmode="browse", style="DutyRoster.Treeview", height=12)
+        names.heading("#0", text="Tên nhân sự (cố định)")
+        names.column("#0", width=220, minwidth=180, stretch=False)
+        names.heading("telegram", text="Telegram Chat ID")
+        names.column("telegram", width=145, minwidth=145, stretch=False, anchor="center")
+        names.grid(row=0, column=0, sticky="ns")
+        tree = ttk.Treeview(table, show="headings", selectmode="browse", style="DutyRoster.Treeview", height=12)
+        tree.grid(row=0, column=1, sticky="nsew")
+        for widget in (names, tree):
+            widget.tag_configure("even", background="#f0f4f8")
+            widget.tag_configure("odd", background="#ffffff")
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=lambda *args: (names.yview(*args), tree.yview(*args)))
+        scrollbar.grid(row=0, column=2, sticky="ns")
+        horizontal = ttk.Scrollbar(table, orient="horizontal", command=tree.xview)
+        horizontal.grid(row=1, column=1, sticky="ew")
+        tree.configure(xscrollcommand=horizontal.set)
+
+        def sync_scroll(other, first, last):
+            scrollbar.set(first, last)
+            if abs(other.yview()[0] - float(first)) > 0.0001:
+                other.yview_moveto(first)
+
+        names.configure(yscrollcommand=lambda first, last: sync_scroll(tree, first, last))
+        tree.configure(yscrollcommand=lambda first, last: sync_scroll(names, first, last))
+        selected_person = tk.StringVar(value="Chưa chọn nhân sự")
+        selected_day = tk.StringVar(value="1")
+        new_shift = tk.StringVar(value="HC")
+        active_person = [None]
+
+        def month_key():
+            value = self.roster_month.get().strip()
+            if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+                raise ValueError("Tháng phải có dạng YYYY-MM")
+            txl.datetime.strptime(value, "%Y-%m")
+            return value
+
+        displayed_month = [None]
+        def refresh():
+            try:
+                key = month_key()
+                data = duty_roster.load(ROSTER_PATH).get(key, {})
+                contacts = duty_roster.load(CONTACTS_PATH)
+                tree.delete(*tree.get_children())
+                names.delete(*names.get_children())
+                displayed_month[0] = key
+                active_person[0] = None
+                selected_person.set("Chưa chọn nhân sự")
+                year, month = map(int, key.split("-"))
+                days = range(1, calendar.monthrange(year, month)[1] + 1)
+                tree.configure(columns=[str(day) for day in days])
+                day_picker.configure(values=list(days))
+                selected_day.set("1")
+                weekdays = ("T2", "T3", "T4", "T5", "T6", "T7", "CN")
+                for day in days:
+                    weekday = weekdays[txl.datetime(year, month, day).weekday()]
+                    tree.heading(str(day), text=f"{day:02d} {weekday}")
+                    tree.column(str(day), width=62, minwidth=62, stretch=False, anchor="center")
+                for index, (ident, person) in enumerate(data.get("people", {}).items()):
+                    tag = "even" if index % 2 == 0 else "odd"
+                    chat_id = contacts.get(duty_roster.normalize(person["name"]), "Chưa có ID")
+                    names.insert("", "end", iid=ident, text=person["name"], values=(chat_id,), tags=(tag,))
+                    tree.insert("", "end", iid=ident, values=[person["shifts"].get(str(day)) or "–" for day in days], tags=(tag,))
+                if not data.get("people"):
+                    selected_person.set("Chưa có lịch tháng này — hãy import lịch Excel")
+            except ValueError:
+                messagebox.showerror("Lịch trực", "Nhập tháng dạng YYYY-MM, ví dụ 2026-10", parent=window)
+
+        def import_file(kind):
+            path = filedialog.askopenfilename(parent=window, filetypes=[("Excel", "*.xlsx")])
+            if not path:
+                return
+            try:
+                if kind == "contacts":
+                    duty_roster.save(CONTACTS_PATH, duty_roster.read_contacts(path))
+                else:
+                    key = month_key()
+                    year, month = map(int, key.split("-"))
+                    rosters = duty_roster.load(ROSTER_PATH)
+                    if key in rosters and not messagebox.askyesno("Nhập lại lịch", "Thay thế lịch tháng này và các chỉnh sửa đã lưu?", parent=window):
+                        return
+                    rosters[key] = duty_roster.read_roster(path, year, month)
+                    duty_roster.save(ROSTER_PATH, rosters)
+                refresh()
+            except Exception as exc:
+                messagebox.showerror("Import lịch/Telegram", str(exc), parent=window)
+
+        ttk.Button(tools, text="Import lịch Excel", command=lambda: import_file("roster")).pack(side="left", padx=5)
+        ttk.Button(tools, text="Import ID Telegram", command=lambda: import_file("contacts")).pack(side="left", padx=5)
+        ttk.Button(tools, text="Xem tháng", command=refresh).pack(side="left", padx=5)
+        editor = ttk.Frame(window)
+        editor.pack(fill="x", padx=10, pady=8)
+        ttk.Label(editor, textvariable=selected_person).pack(side="left", padx=(0, 10))
+        ttk.Label(editor, text="Ngày:").pack(side="left")
+        day_picker = ttk.Combobox(editor, textvariable=selected_day, state="readonly", width=3)
+        day_picker.pack(side="left", padx=5)
+        ttk.Label(editor, text="Ca:").pack(side="left")
+        ttk.Combobox(editor, textvariable=new_shift, values=("HC", "Đêm", "Nghỉ"), state="readonly", width=10).pack(side="left", padx=5)
+
+        def show_current_shift():
+            ident = active_person[0]
+            if ident and tree.exists(ident):
+                current = tree.set(ident, selected_day.get())
+                new_shift.set("Nghỉ" if current == "–" else current)
+
+        def select_person(widget):
+            selection = widget.selection()
+            if not selection:
+                return
+            ident = selection[0]
+            active_person[0] = ident
+            selected_person.set(names.item(ident, "text"))
+            for other in (names, tree):
+                if other.selection() != (ident,):
+                    other.selection_set(ident)
+            show_current_shift()
+
+        def select_cell(event):
+            ident = tree.identify_row(event.y)
+            column = tree.identify_column(event.x)
+            if ident and column and column != "#0":
+                selected_day.set(tree["columns"][int(column[1:]) - 1])
+                tree.selection_set(ident)
+                select_person(tree)
+
+        names.bind("<<TreeviewSelect>>", lambda event: select_person(names))
+        tree.bind("<<TreeviewSelect>>", lambda event: select_person(tree))
+        tree.bind("<ButtonRelease-1>", select_cell)
+        day_picker.bind("<<ComboboxSelected>>", lambda event: show_current_shift())
+
+        def edit_shift():
+            try:
+                key = month_key()
+                if key != displayed_month[0]:
+                    raise ValueError("Bấm Xem tháng trước khi chọn dòng để đổi ca")
+                if not active_person[0]:
+                    raise ValueError("Hãy chọn ô ca trực hoặc tên nhân sự và ngày")
+                rosters = duty_roster.load(ROSTER_PATH)
+                ident, day = active_person[0], selected_day.get()
+                rosters[key]["people"][ident]["shifts"][day] = "" if new_shift.get() == "Nghỉ" else new_shift.get()
+                duty_roster.save(ROSTER_PATH, rosters)
+                tree.set(ident, day, "–" if new_shift.get() == "Nghỉ" else new_shift.get())
+            except (ValueError, KeyError, OSError) as exc:
+                messagebox.showerror("Đổi ca", str(exc), parent=window)
+
+        ttk.Button(editor, text="Lưu đổi ca", command=edit_shift).pack(side="left", padx=5)
+        ttk.Label(window, text="Bấm ô để đổi ca. HC 08:00–17:00; Đêm 17:00–08:00 hôm sau; –: Nghỉ. Kéo thanh ngang để xem các ngày.").pack(pady=4)
+        refresh()
+
+    def _reauthenticate(self, page):
+        delay = 60
+        rejected_credentials = 0
+        while not self.stop_requested:
+            if not self._onebss_session_expired(page) and page.locator("text=Trang chủ").count():
+                self._save_browser_storage_state(page.context)
+                return
+            if not self._remote_config:
+                self.write_log("Phiên hết hạn: chờ đăng nhập/OTP trong trình duyệt; sẽ tự tiếp tục.")
+                while not self.stop_requested:
+                    if not self._onebss_session_expired(page) and page.locator("text=Trang chủ").count():
+                        self._save_browser_storage_state(page.context)
+                        return
+                    page.wait_for_timeout(1000)
+                break
+            user, password, allowed, selector = self._remote_config
+            try:
+                page.goto(ONEBSS_URL + "#/auth/login", wait_until="domcontentloaded")
+                switch = page.get_by_role("button", name="Dùng tài khoản khác", exact=True)
+                if switch.count() and switch.is_visible():
+                    switch.click()
+                page.locator('input[placeholder="Tài khoản"]').wait_for(timeout=15000)
+                remote_login.login(page, user, password, self._telegram_token_for_alerts, allowed,
+                                   selector, lambda: self.stop_requested,
+                                   lambda: not self._onebss_session_expired(page) and bool(page.locator("text=Trang chủ").count()),
+                                   self.write_log)
+                self._save_browser_storage_state(page.context)
+                self.write_log("Đăng nhập lại thành công; tiếp tục quy trình.")
+                return
+            except Exception as exc:
+                if isinstance(exc, remote_login.LoginError):
+                    self.write_log(str(exc))
+                if isinstance(exc, remote_login.InvalidCredentials):
+                    rejected_credentials += 1
+                    if rejected_credentials >= 3:
+                        self.write_log("Mật khẩu bị từ chối 3 lần: tạm ngừng tự nhập để tránh khóa tài khoản; chờ đăng nhập trực tiếp.")
+                        self._remote_config = None
+                        continue
+                self.write_log(f"Đăng nhập lại chưa thành công; thử lại sau {delay} giây. Có thể đăng nhập trực tiếp hoặc bấm Dừng.")
+                for _ in range(delay):
+                    if self.stop_requested:
+                        break
+                    if not self._onebss_session_expired(page) and page.locator("text=Trang chủ").count():
+                        self._save_browser_storage_state(page.context)
+                        return
+                    page.wait_for_timeout(1000)
+                delay = min(delay * 2, 300)
+        raise remote_login.LoginError("Đã dừng đăng nhập OneBSS")
+
+    def _read_two_scopes(self, page):
+        frames = []
+        today = time.strftime("%d/%m/%Y")
+        self.after(0, lambda: (self.from_date.set(today), self.to_date.set(today)))
+        scope_count = len(SEARCH_SCOPES)
+        for number, (units, provinces) in enumerate(SEARCH_SCOPES, 1):
+            self._ensure_onebss_session_active(page)
+            self._fill_date(page, today, 0)
+            self._fill_date(page, today, 1)
+            self._ensure_all_statuses(page)
+            self._clear_tree_selections(page, 0)
+            self._clear_tree_selections(page, 1)
+            for tree_index in (0, 1):
+                if page.locator(".vue-treeselect").nth(tree_index).locator(".vue-treeselect__multi-value-item").count():
+                    raise RuntimeError("Không xóa được bộ lọc trước lượt tìm kiếm; không đọc phạm vi bị lẫn")
+            self._expand_tree_parent(page, "Đài HTDV CNTT&DVS", 0)
+            for unit in units:
+                self._ensure_tree_checked(page, unit, 0)
+            for province in provinces:
+                self._ensure_tree_checked(page, province, 1)
+            self.write_log(f"Tìm kiếm phạm vi {number}/{scope_count}: {', '.join(units)}")
+            page.get_by_text("Tìm kiếm", exact=True).click(timeout=15000)
+            self._wait_for_search_complete(page)
+            frame = onebss_grid.read(page, lambda: self.stop_requested, self.write_log)
+            self._ensure_onebss_session_active(page)
+            self.write_log(f"Đã đọc đủ {len(frame)} phiếu từ bảng phạm vi {number}/{scope_count}.")
+            frames.append(frame)
+        result = txl.pd.concat(frames, ignore_index=True).drop_duplicates("ma_bh", keep="last")
+        return result.reset_index(drop=True)
+
+    def _send_routed_alerts(self, preprocessing, completion, in_progress, scope_label=None):
+        destinations = []
+        if self._alert_destination in ("Group", "Cả hai"):
+            destinations.append((os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"], None))
+        if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
+            ids = duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
+            destinations.extend((ident, ident) for ident in ids)
+        failures = []
+        for ident, state_recipient in destinations:
+            for frame, builder in ((preprocessing, txl.build_bh_message), (completion, txl.build_completion_message),
+                                   (in_progress, txl.build_in_progress_message)):
+                operational = builder is txl.build_in_progress_message
+                pending, _ = _get_new_in_progress_alerts(frame, state_recipient) if operational else (frame, {})
+                # Small per-ticket batches avoid Telegram's 4096-character limit.
+                for index in range(len(pending)):
+                    if self.stop_requested:
+                        return
+                    ticket = pending.iloc[index:index + 1]
+                    try:
+                        if builder is txl.build_bh_message:
+                            ticket = ticket.copy()
+                            for field in ("ma_bh", "loaihinh_tb", "ten_nv", "DONVI", "ngay_bh"):
+                                ticket[field] = ticket[field].map(lambda v: html.escape(str(v)))
+                        message = builder(ticket)
+                        if scope_label:
+                            message = message.replace(
+                                "</b>",
+                                "</b>\n<i>Phạm vi: " + html.escape(scope_label) + "</i>",
+                                1,
+                            )
+                        txl.send_telegram_message(message, chat_id=ident, bot_token=self._telegram_token_for_alerts)
+                        if operational:
+                            _, milestone = _get_new_in_progress_alerts(ticket, state_recipient)
+                            _record_in_progress_alerts(milestone)
+                        for _ in range(31 if ident.startswith("-") else 11):
+                            if self.stop_requested:
+                                return
+                            time.sleep(0.1)
+                    except Exception:
+                        failures.append(ident)
+                        self.write_log(f"Gửi cảnh báo tới Chat ID {ident} chưa thành công; không ghi nhận mốc chưa gửi.")
+                        break
+        if failures:
+            raise RuntimeError("Có người nhận Telegram chưa nhận được cảnh báo. Kiểm tra Chat ID, quyền bot và Start bot.")
+        self.write_log(f"Đã xử lý cảnh báo cho {len(destinations)} nơi nhận; chỉ gửi mốc mới của phiếu đang thực hiện.")
 
     def write_log(self, text):
         self.after(0, self._append_log, text)
@@ -588,6 +1010,24 @@ class ATSApp(tk.Tk):
         if self.worker and self.worker.is_alive():
             self.write_log("Chrome đã mở. Hãy đăng nhập rồi bấm nút 2.")
             return
+        interval_minutes = _parse_repeat_minutes(self.repeat_minutes.get())
+        if interval_minutes is None:
+            messagebox.showerror(
+                "Chu kỳ không hợp lệ",
+                "Số phút lặp lại phải là số nguyên từ 1 đến 10080.",
+            )
+            return
+        self.auto_repeat = bool(self.schedule_enabled.get())
+        self.repeat_seconds = interval_minutes * 60
+        try:
+            _save_settings({
+                **_load_settings(),
+                "schedule_enabled": self.auto_repeat,
+                "repeat_minutes": interval_minutes,
+            })
+        except OSError as exc:
+            messagebox.showerror("Cấu hình chu kỳ", f"Không lưu được chu kỳ lặp: {exc}")
+            return
         try:
             self._error_recipient_ids = _parse_recipient_chat_ids(
                 self.error_recipient_chat_ids.get()
@@ -596,6 +1036,12 @@ class ATSApp(tk.Tk):
             messagebox.showerror("Chat ID nhận cảnh báo lỗi", str(exc))
             return
         self._telegram_token_for_alerts = self.telegram_token.get().strip()
+        # The post-login auto-run skips _apply_telegram_config(), so seed the
+        # legacy TXL environment used by the shared alert-routing code here too.
+        os.environ["TXL_TELEGRAM_BOT_TOKEN"] = self._telegram_token_for_alerts
+        os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"] = self.telegram_chat_id.get().strip()
+        if self.mb_extended and not self._prepare_preview_config():
+            return
         if self._error_recipient_ids and not self._telegram_token_for_alerts:
             messagebox.showerror(
                 "Thiếu Telegram Bot token",
@@ -621,7 +1067,7 @@ class ATSApp(tk.Tk):
             if self.start_event:
                 if not self._apply_telegram_config():
                     return
-                if not self._validate_telegram_group():
+                if self._alert_destination != "Nhân sự trong ca" and not self._validate_telegram_group():
                     return
                 self.run_btn.configure(state="disabled")
                 self.write_log("Bắt đầu bước 2: cấu hình OneBSS và chạy quy trình...")
@@ -656,7 +1102,7 @@ class ATSApp(tk.Tk):
     def _apply_telegram_config(self):
         token = self.telegram_token.get().strip()
         chat_id = self.telegram_chat_id.get().strip()
-        if not token or not chat_id:
+        if not token or (not chat_id and self.destination.get() != "Nhân sự trong ca"):
             messagebox.showerror(
                 "Thiếu cấu hình Telegram",
                 "Hãy nhập Telegram Bot token và Group chat ID trước khi chạy.",
@@ -669,18 +1115,16 @@ class ATSApp(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Chat ID nhận cảnh báo lỗi", str(exc))
             return False
-        try:
-            interval_minutes = int(self.repeat_minutes.get().strip())
-            if not 1 <= interval_minutes <= 10080:
-                raise ValueError
-        except ValueError:
+        self.auto_repeat = bool(self.schedule_enabled.get())
+        interval_minutes = _parse_repeat_minutes(self.repeat_minutes.get())
+        if interval_minutes is None:
             messagebox.showerror(
                 "Chu kỳ không hợp lệ",
                 "Số phút lặp lại phải là số nguyên từ 1 đến 10080.",
             )
             return False
-
-        self.auto_repeat = bool(self.schedule_enabled.get())
+        if self.mb_extended and not self._prepare_preview_config():
+            return False
         self.repeat_seconds = interval_minutes * 60
         self._telegram_token_for_alerts = token
         self._error_recipient_ids = error_recipient_ids
@@ -689,7 +1133,7 @@ class ATSApp(tk.Tk):
         os.environ[TELEGRAM_TOKEN_ENV] = token
         os.environ[TELEGRAM_CHAT_ENV] = chat_id
         try:
-            _save_settings({
+            _save_settings({**_load_settings(),
                 "telegram_token": token,
                 "telegram_chat_id": chat_id,
                 "error_recipient_chat_ids": error_recipient_ids,
@@ -732,6 +1176,9 @@ class ATSApp(tk.Tk):
 
     def _fetch_private_chats(self):
         """Fetch recent private bot conversations without requiring Terminal."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Telegram", "Hãy dừng quy trình trước khi lấy Chat ID để không tranh luồng OTP.")
+            return
         token = self.telegram_token.get().strip()
         if not token:
             messagebox.showerror(
@@ -1162,34 +1609,54 @@ class ATSApp(tk.Tk):
                 self.current_stage = "Mở OneBSS"
                 page.goto(ONEBSS_URL, wait_until="domcontentloaded")
                 self.write_log(
-                    "Bước 1: Chrome đã mở. Hãy đăng nhập OneBSS; "
-                    "chương trình sẽ giữ nguyên website sau khi đăng nhập."
+                    "Chrome đã mở OneBSS. Hãy đăng nhập nếu được yêu cầu; "
+                    "sau khi xác nhận đăng nhập, ứng dụng sẽ tự cấu hình và chạy."
                 )
                 self.current_stage = "Chờ người dùng đăng nhập OneBSS"
-                self._wait_for_login(page)
+                auto_run_after_login = self._wait_for_login(page)
                 self._save_browser_storage_state(ctx)
-                self.write_log(
-                    "Đăng nhập thành công. Website không bị làm mới; "
-                    "hãy bấm nút 2 để cấu hình và chạy."
-                )
-                self.after(0, lambda: self.run_btn.configure(state="normal"))
-                self.current_stage = "Chờ bắt đầu quy trình"
-                self.start_event.wait()
+                if auto_run_after_login:
+                    self.write_log("Đã xác nhận đăng nhập OneBSS; tự bắt đầu cấu hình và chạy quy trình.")
+                    self.current_stage = "Tự bắt đầu quy trình sau đăng nhập"
+                    self.start_event.set()
+                else:
+                    self.write_log(
+                        "Đăng nhập thành công. Website không bị làm mới; "
+                        "hãy bấm nút 2 để cấu hình và chạy."
+                    )
+                    self.after(0, lambda: self.run_btn.configure(state="normal"))
+                    self.current_stage = "Chờ bắt đầu quy trình"
+                    self.start_event.wait()
                 if self.stop_requested:
                     return
                 self.current_stage = "Mở màn hình và cấu hình bộ lọc OneBSS"
-                self._navigate_onebss(page)
+                try:
+                    self._navigate_onebss(page)
+                except remote_login.SessionExpired:
+                    self._reauthenticate(page)
+                    self._navigate_onebss(page)
                 self._save_browser_storage_state(ctx)
                 self.after(0, lambda: self.progress.start(10))
                 cycle = 1
                 while not self.stop_requested:
                     self.current_stage = f"Chu kỳ {cycle}: kiểm tra phiên OneBSS"
+                    if self.mb_extended and self._onebss_session_expired(page):
+                        self._reauthenticate(page)
+                        self._navigate_onebss(page)
                     self._ensure_onebss_session_active(page)
                     if cycle > 1:
                         self.write_log(f"Bắt đầu chu kỳ tự động lần {cycle}.")
-                    ctx, page, excel = self._export_excel_with_recovery(
-                        p, ctx, page, cycle
-                    )
+                    if self.macos_preview:
+                        try:
+                            excel = self._read_two_scopes(page)
+                        except Exception as exc:
+                            if isinstance(exc, remote_login.SessionExpired) or self._onebss_session_expired(page):
+                                self._reauthenticate(page)
+                                self._navigate_onebss(page)
+                                continue  # discard partial results; restart both searches
+                            raise
+                    else:
+                        ctx, page, excel = self._export_excel_with_recovery(p, ctx, page, cycle)
                     self.browser_context, self.browser_page = ctx, page
                     self.current_stage = f"Chu kỳ {cycle}: xử lý dữ liệu và gửi Telegram"
                     self._process_and_send(excel)
@@ -1222,18 +1689,24 @@ class ATSApp(tk.Tk):
             self.after(0, lambda error_text=error_text: messagebox.showerror(APP_NAME, error_text))
         finally:
             self.current_stage = "Đã dừng"
+            self._remote_config = None
             self.after(0, self.progress.stop)
             self.after(0, self._release_keep_awake)
             self.after(0, lambda: self.start_btn.configure(state="normal"))
             self.after(0, lambda: self.run_btn.configure(state="disabled"))
 
     def _wait_for_login(self, page):
+        if (self.mb_extended and self._remote_config
+                and self._onebss_session_expired(page)):
+            self._reauthenticate(page)
+            return True
         for _ in range(180):
             if self.stop_requested:
                 raise RuntimeError("Đã dừng bởi người dùng")
             url = page.url.lower()
-            if "login" not in url and ("onebss" in url or page.locator("text=Trang chủ").count()):
-                return
+            if (not self._onebss_session_expired(page)
+                    and ("onebss" in url or page.locator("text=Trang chủ").count())):
+                return self.mb_extended
             time.sleep(1)
         raise RuntimeError("Hết thời gian chờ đăng nhập OneBSS")
 
@@ -1255,6 +1728,8 @@ class ATSApp(tk.Tk):
                 "Trình duyệt OneBSS đã bị đóng. Hãy mở lại ứng dụng để tiếp tục."
             )
         if self._onebss_session_expired(page):
+            if self.mb_extended:
+                raise remote_login.SessionExpired("Phiên OneBSS hết hạn; cần đăng nhập lại")
             raise RuntimeError(
                 "Phiên đăng nhập OneBSS đã hết hạn. Hãy mở ứng dụng và đăng nhập lại OneBSS."
             )
@@ -1349,6 +1824,8 @@ class ATSApp(tk.Tk):
                 return
             except Exception as exc:
                 last_error = exc
+                if self.mb_extended and self._onebss_session_expired(page):
+                    raise remote_login.SessionExpired("OneBSS hết phiên trong khi mở màn hình tìm kiếm") from None
                 self.write_log(f"Lần cấu hình {attempt}/3 chưa thành công: {exc}")
                 if attempt < 3:
                     page.reload(wait_until="domcontentloaded", timeout=30000)
@@ -1367,10 +1844,16 @@ class ATSApp(tk.Tk):
         self._clear_tree_selections(page, 1)
 
         self._expand_tree_parent(page, "Đài HTDV CNTT&DVS", 0)
-        self._ensure_tree_checked(page, UNIT_LABEL, 0)
-        for label in ("Tập trung", "Miền Bắc", "Miền Trung", "Miền Nam"):
+        units, provinces = SEARCH_SCOPES[0]
+        for label in units:
+            self._ensure_tree_checked(page, label, 0)
+        for label in provinces:
             self._ensure_tree_checked(page, label, 1)
-        self.write_log(f"Đã cấu hình ngày, trạng thái, đơn vị {UNIT_LABEL} và tỉnh.")
+        self.write_log(
+            "Đã cấu hình ngày, tất cả trạng thái, đơn vị "
+            + ", ".join(units)
+            + " và tỉnh."
+        )
 
     def _ensure_all_statuses(self, page):
         status_wrapper = page.locator('select[name="statusId"]').locator("xpath=..").first
@@ -1689,48 +2172,78 @@ class ATSApp(tk.Tk):
 
     def _process_and_send(self, excel):
         """Use the transferred MonitorTXL source directly on macOS/Windows."""
-        self.write_log("Đang xử lý Excel bằng mã nguồn MonitorTXL...")
-        frame = txl.process_bh_file(str(excel))
+        is_grid = isinstance(excel, txl.pd.DataFrame)
+        self.write_log("Đang xử lý bảng OneBSS..." if is_grid else "Đang xử lý Excel bằng mã nguồn MonitorTXL...")
+        source_frame = excel.copy() if is_grid else txl.pd.read_excel(excel, dtype=object)
+        mb_staff, mb_installation = split_mb_ticket_scopes(
+            source_frame,
+            duty_roster.load(CONTACTS_PATH),
+        )
+        alert_scopes = (
+            ("Nhân sự MB", mb_staff),
+            ("Địa chỉ lắp đặt MB", mb_installation),
+        )
+        report_source = txl.pd.concat([mb_staff, mb_installation], ignore_index=True)
+        self.write_log(
+            f"Lọc MB: {len(mb_staff)} phiếu có nhân viên trong danh sách ID chat; "
+            f"{len(mb_installation)} phiếu có tỉnh lắp đặt miền Bắc sau loại trừ nhân viên MB."
+        )
+        if is_grid:
+            txl.FILE_DATA_TIME = txl.datetime.now()
+        frame = txl.process_bh_file(report_source)
         alert_frame = txl.get_alert_dataframe_bh(frame)
         self.write_log(
             f"Đã lọc {len(frame)} phiếu phù hợp; "
             f"có {len(alert_frame)} phiếu từ 10 phút trở lên."
         )
-        if len(frame):
-            report = DOWNLOADS / ("Thong_ke_SLA_TXL_BH_" + time.strftime("%Y%m%d_%H%M%S") + ".xlsx")
-            txl.FILE_DATA_TIME = txl.get_file_datetime(str(excel))
-            txl.export_bh_excel(frame, str(report))
+        completion, in_progress = txl.get_operational_alert_data(report_source)
+        if len(frame) or len(completion) or len(in_progress):
+            report = DOWNLOADS / ("Bao_cao_TOMS_SLA_MB_" + time.strftime("%Y%m%d_%H%M%S") + ".xlsx")
+            if len(frame):
+                txl.FILE_DATA_TIME = txl.datetime.now() if is_grid else txl.get_file_datetime(str(excel))
+                txl.export_bh_excel(frame, str(report))
+            txl.append_operational_alert_sheets(completion, in_progress, str(report))
             self.write_log(f"Đã tạo báo cáo: {report}")
 
-        if len(alert_frame) == 0:
+        for scope_label, scope_frame in alert_scopes:
+            txl.FILE_DATA_TIME = txl.datetime.now()
+            scope_txl = txl.process_bh_file(scope_frame)
+            scope_preprocessing = txl.get_alert_dataframe_bh(scope_txl)
+            scope_completion, scope_in_progress = txl.get_operational_alert_data(scope_frame)
             self.write_log(
-                "Không có phiếu Tiền xử lý báo hỏng từ 10 phút trở lên; "
-                "bỏ qua gửi Telegram."
+                f"{scope_label}: TXL {len(scope_preprocessing)}, chưa nghiệm thu "
+                f"{len(scope_completion)}, đang thực hiện {len(scope_in_progress)} phiếu."
             )
-        else:
-            message = txl.build_bh_message(alert_frame)
-            txl.send_telegram_message(message)
-            self.write_log(
-                f"Đã gửi Telegram cho {len(alert_frame)} phiếu từ 10 phút trở lên."
+            self._send_routed_alerts(
+                scope_preprocessing,
+                scope_completion,
+                scope_in_progress,
+                scope_label,
             )
-        completion_frame, in_progress_frame = txl.get_operational_alert_data(str(excel))
-        if len(completion_frame):
-            txl.send_telegram_message(txl.build_completion_message(completion_frame))
-            self.write_log(f"Đã gửi cảnh báo {len(completion_frame)} phiếu chưa nghiệm thu.")
-        pending_in_progress, milestones = _get_new_in_progress_alerts(in_progress_frame)
-        if len(pending_in_progress):
-            txl.send_telegram_message(txl.build_in_progress_message(pending_in_progress))
-            _record_in_progress_alerts(milestones)
-            self.write_log(f"Đã gửi cảnh báo {len(pending_in_progress)} phiếu đang thực hiện ở mốc mới.")
-        elif len(in_progress_frame):
-            self.write_log("Phiếu đang thực hiện chưa đến mốc cảnh báo 60 phút tiếp theo.")
 
 
 if __name__ == "__main__":
-    # Used only by the Windows build pipeline.  This verifies that a frozen
-    # EXE can load Python, Playwright and the application's imports without
-    # opening a GUI or requiring OneBSS/Telegram configuration.
+    # Used by the Windows build pipeline without opening a GUI or requiring
+    # OneBSS/Telegram credentials.
     if "--self-test" in sys.argv:
+        expected_units = {
+            "Phòng HTKH Miền Bắc (VIP 1)",
+            "Phòng HTKH Miền Nam (VIP 2)",
+            "Phòng HTKH Miền Trung (VIP 3)",
+        }
+        expected_regions = {"Tập trung", "Miền Bắc", "Miền Trung", "Miền Nam"}
+        if len(SEARCH_SCOPES) != 1 or set(SEARCH_SCOPES[0][0]) != expected_units or set(SEARCH_SCOPES[0][1]) != expected_regions:
+            raise SystemExit("MB OneBSS scope self-test failed")
+        if _parse_repeat_minutes("5") != 5:
+            raise SystemExit("5-minute schedule self-test failed")
+        sample = txl.pd.DataFrame([
+            {"ten_nv": "Nhân sự MB", "tentinh": "Tỉnh Cà Mau", "diachi_ld": "Cà Mau"},
+            {"ten_nv": "Người khác", "tentinh": "Thành phố Hà Nội", "diachi_ld": "Hà Nội"},
+            {"ten_nv": "Người khác", "tentinh": "Tỉnh Cà Mau", "diachi_ld": "Cà Mau"},
+        ])
+        staff, installation = split_mb_ticket_scopes(sample, {"nhân sự mb": "123"})
+        if len(staff) != 1 or len(installation) != 1 or installation.iloc[0]["ten_nv"] != "Người khác":
+            raise SystemExit("MB ticket-routing self-test failed")
         raise SystemExit(0)
     if "--browser-self-test" in sys.argv:
         if sync_playwright is None:

@@ -14,7 +14,7 @@ from tkinter import ttk
 from tkinter import filedialog
 from tkinter import messagebox
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import (
     Font,
     Alignment,
@@ -674,7 +674,7 @@ def process_bh_file(filepath):
 
     try:
 
-        df = pd.read_excel(
+        df = filepath.copy() if isinstance(filepath, pd.DataFrame) else pd.read_excel(
             filepath,
             dtype=object
         )
@@ -1075,7 +1075,7 @@ def get_alert_dataframe_ht(df):
 def get_operational_alert_data(filepath):
     """Return the completion and in-progress alerts from one OneBSS export."""
     try:
-        df = pd.read_excel(filepath, dtype=object)
+        df = filepath.copy() if isinstance(filepath, pd.DataFrame) else pd.read_excel(filepath, dtype=object)
     except Exception as exc:
         raise RuntimeError(f"Không đọc được file cảnh báo vận hành: {exc}") from exc
 
@@ -1153,6 +1153,54 @@ def build_in_progress_message(df):
         "Khẩn trương hoàn tất xử lý",
         include_round=True,
     )
+
+
+def append_operational_alert_sheets(completion_df, in_progress_df, save_path):
+    """Add the two operational alert lists to the cycle's Excel report."""
+    datasets = (
+        ("Chưa nghiệm thu", completion_df, False),
+        ("Đang thực hiện", in_progress_df, True),
+    )
+    if not any(len(frame) for _, frame, _ in datasets):
+        return
+
+    path = os.fspath(save_path)
+    wb = load_workbook(path) if os.path.exists(path) else Workbook()
+    if wb.sheetnames == ["Sheet"] and wb["Sheet"].max_row == 1 and wb["Sheet"]["A1"].value is None:
+        wb.remove(wb["Sheet"])
+
+    headers = [
+        ("Mã báo hỏng", "ma_bh"),
+        ("Loại hình", "loaihinh_tb"),
+        ("Người mở phiếu", "ten_nv"),
+        ("Đơn vị", "DONVI"),
+        ("Ngày mở phiếu", "ngay_bh"),
+        ("Trạng thái cảnh báo", "alert_status"),
+        ("Đơn vị xử lý", "ten_dv_xl"),
+        ("Đơn vị đang thực hiện", "ten_dv_dang_th"),
+        ("Thời gian (phút)", "thoigian_xl_bh"),
+    ]
+    for title, frame, include_round in datasets:
+        if not len(frame):
+            continue
+        sheet_name = title
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+        ws.append([header for header, _ in headers] + (["Mốc cảnh báo"] if include_round else []))
+        style_header_row(ws, 1)
+        for _, record in frame.iterrows():
+            values = []
+            for _, field in headers:
+                value = record.get(field, "")
+                values.append("" if pd.isna(value) else value)
+            if include_round:
+                values.append(f"Lần {int(record['alert_round'])}")
+            ws.append(values)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        autosize_columns(ws)
+    wb.save(path)
 
 
 def get_under10_dataframe_bh(df):
