@@ -35,7 +35,9 @@ import updater
 import duty_roster
 import onebss_grid
 import remote_login
-from config import APP_DATA_ENV, APP_NAME, APP_SLUG, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
+import service_catalog
+import service_ui
+from config import APP_DATA_ENV, APP_NAME, APP_SLUG, SERVICE_CATALOG_API_URL, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
 from version import APP_VERSION, DIAGNOSTICS_REPOSITORY, UPDATE_CHECK_INTERVAL_SECONDS
 
 
@@ -275,6 +277,7 @@ class ATSApp(tk.Tk):
         self.remote_enabled = tk.BooleanVar(value=saved.get("remote_login_enabled", False))
         self.otp_chat_ids = tk.StringVar(value=saved.get("otp_chat_ids", ""))
         self.otp_selector = tk.StringVar(value=saved.get("otp_selector", 'input[placeholder="Mã OTP"]'))
+        self.service_preferences = {key: saved[key] for key in ("service_filter_mode", "selected_service_ids", "selected_service_label_ids") if key in saved}
         self._remote_config = None
         self._alert_destination = self.destination.get()
         self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
@@ -352,6 +355,7 @@ class ATSApp(tk.Tk):
             state="disabled",
         )
         self.run_btn.pack(side="left", padx=4)
+        ttk.Button(actions, text="Dịch vụ", command=self._open_service_settings).pack(side="left", padx=4)
         ttk.Button(actions, text="Dừng", command=self.request_stop).pack(side="left", padx=4)
         ttk.Checkbutton(actions, text="Tự động cảnh báo sau", variable=self.schedule_enabled).pack(side="left", padx=(12, 4))
         ttk.Spinbox(actions, from_=1, to=10080, textvariable=self.repeat_minutes, width=6).pack(side="left")
@@ -2175,6 +2179,7 @@ class ATSApp(tk.Tk):
         is_grid = isinstance(excel, txl.pd.DataFrame)
         self.write_log("Đang xử lý bảng OneBSS..." if is_grid else "Đang xử lý Excel bằng mã nguồn MonitorTXL...")
         source_frame = excel.copy() if is_grid else txl.pd.read_excel(excel, dtype=object)
+        catalog = self._refresh_service_catalog(source_frame)
         mb_staff, mb_installation = split_mb_ticket_scopes(
             source_frame,
             duty_roster.load(CONTACTS_PATH),
@@ -2191,12 +2196,15 @@ class ATSApp(tk.Tk):
         if is_grid:
             txl.FILE_DATA_TIME = txl.datetime.now()
         frame = txl.process_bh_file(report_source)
+        frame = self._filter_service_frame(frame, catalog)
         alert_frame = txl.get_alert_dataframe_bh(frame)
         self.write_log(
             f"Đã lọc {len(frame)} phiếu phù hợp; "
             f"có {len(alert_frame)} phiếu từ 10 phút trở lên."
         )
         completion, in_progress = txl.get_operational_alert_data(report_source)
+        completion = self._filter_service_frame(completion, catalog)
+        in_progress = self._filter_service_frame(in_progress, catalog)
         if len(frame) or len(completion) or len(in_progress):
             report = DOWNLOADS / ("Bao_cao_TOMS_SLA_MB_" + time.strftime("%Y%m%d_%H%M%S") + ".xlsx")
             if len(frame):
@@ -2208,8 +2216,11 @@ class ATSApp(tk.Tk):
         for scope_label, scope_frame in alert_scopes:
             txl.FILE_DATA_TIME = txl.datetime.now()
             scope_txl = txl.process_bh_file(scope_frame)
+            scope_txl = self._filter_service_frame(scope_txl, catalog)
             scope_preprocessing = txl.get_alert_dataframe_bh(scope_txl)
             scope_completion, scope_in_progress = txl.get_operational_alert_data(scope_frame)
+            scope_completion = self._filter_service_frame(scope_completion, catalog)
+            scope_in_progress = self._filter_service_frame(scope_in_progress, catalog)
             self.write_log(
                 f"{scope_label}: TXL {len(scope_preprocessing)}, chưa nghiệm thu "
                 f"{len(scope_completion)}, đang thực hiện {len(scope_in_progress)} phiếu."
@@ -2220,6 +2231,43 @@ class ATSApp(tk.Tk):
                 scope_in_progress,
                 scope_label,
             )
+
+    def _open_service_settings(self):
+        client = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL)
+        service_ui.open_service_window(self, client, self.service_preferences, self._save_service_preferences)
+
+    def _save_service_preferences(self, value):
+        self.service_preferences = value
+        _save_settings({**_load_settings(), **value})
+        self.write_log("Đã lưu lựa chọn lọc dịch vụ riêng trên máy này.")
+
+    def _refresh_service_catalog(self, source_frame):
+        client = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL)
+        catalog = client.get()
+        if "loaihinh_tb" not in source_frame.columns:
+            raise service_catalog.CatalogError("Bảng OneBSS thiếu cột Loại hình thuê bao")
+        known = {service_catalog.service_key(item["ten_dich_vu"]) for item in catalog["services"]}
+        discovered = {}
+        for value in source_frame["loaihinh_tb"].dropna().astype(str):
+            value = value.strip()
+            if value and service_catalog.service_key(value) not in known:
+                discovered.setdefault(service_catalog.service_key(value), value)
+        if discovered:
+            added = client.sync_services(list(discovered.values()))
+            catalog = client.get()
+            names = [item["ten_dich_vu"] for item in added]
+            if names:
+                try:
+                    txl.send_telegram_message("Dịch vụ mới trên OneBSS:\n" + "\n".join("• " + html.escape(name) for name in names), bot_token=self._telegram_token_for_alerts)
+                except Exception as exc:
+                    self.write_log(f"Chưa gửi được thông báo dịch vụ mới qua Telegram: {exc}")
+                self.write_log("Đã đồng bộ dịch vụ mới: " + ", ".join(names))
+        return catalog
+
+    def _filter_service_frame(self, frame, catalog):
+        if self.service_preferences.get("service_filter_mode", "all") != "custom":
+            return frame
+        return service_catalog.filter_selected_services(frame, self.service_preferences.get("selected_service_ids", []), self.service_preferences.get("selected_service_label_ids", []), catalog)
 
 
 if __name__ == "__main__":
@@ -2244,6 +2292,12 @@ if __name__ == "__main__":
         staff, installation = split_mb_ticket_scopes(sample, {"nhân sự mb": "123"})
         if len(staff) != 1 or len(installation) != 1 or installation.iloc[0]["ten_nv"] != "Người khác":
             raise SystemExit("MB ticket-routing self-test failed")
+        catalog = {"services": [{"service_id": "s1", "ten_dich_vu": "MetroNet FE"}],
+                   "labels": [{"label_id": "l1", "ten_nhan": "Nhánh 4"}],
+                   "links": [{"label_id": "l1", "service_id": "s1"}]}
+        service_frame = txl.pd.DataFrame([{"loaihinh_tb": "MetroNet FE"}, {"loaihinh_tb": "Khác"}])
+        if len(service_catalog.filter_selected_services(service_frame, [], ["l1"], catalog)) != 1:
+            raise SystemExit("MB service-label filtering self-test failed")
         raise SystemExit(0)
     if "--browser-self-test" in sys.argv:
         if sync_playwright is None:
