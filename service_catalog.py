@@ -44,18 +44,40 @@ def validate_catalog(data):
         if not isinstance(item, dict) or not item.get("label_id"):
             raise CatalogError("Danh mục có nhãn sai cấu trúc")
         _clean_text(item.get("ten_nhan"), MAX_LABEL_NAME, "Tên nhãn")
+    staff = data.get("staff", [])
+    staff_labels = data.get("staff_labels", [])
+    staff_links = data.get("staff_links", [])
+    if not all(isinstance(value, list) for value in (staff, staff_labels, staff_links)):
+        raise CatalogError("API danh mục thiếu dữ liệu nhân sự")
+    for item in staff:
+        if not isinstance(item, dict) or not item.get("staff_id"):
+            raise CatalogError("Danh mục có nhân sự sai cấu trúc")
+    for item in staff_labels:
+        if not isinstance(item, dict) or not item.get("staff_label_id"):
+            raise CatalogError("Danh mục có nhãn nhân sự sai cấu trúc")
+        _clean_text(item.get("ten_nhan"), MAX_LABEL_NAME, "Tên nhãn nhân sự")
     valid_service_ids = {str(item["service_id"]) for item in services}
     valid_label_ids = {str(item["label_id"]) for item in labels}
+    valid_staff_ids = {str(item["staff_id"]) for item in staff}
+    valid_staff_label_ids = {str(item["staff_label_id"]) for item in staff_labels}
     for item in links:
         if (not isinstance(item, dict)
                 or str(item.get("service_id")) not in valid_service_ids
                 or str(item.get("label_id")) not in valid_label_ids):
             raise CatalogError("Danh mục có liên kết nhãn-dịch vụ sai cấu trúc")
+    for item in staff_links:
+        if (not isinstance(item, dict)
+                or str(item.get("staff_id")) not in valid_staff_ids
+                or str(item.get("staff_label_id")) not in valid_staff_label_ids):
+            raise CatalogError("Danh mục có liên kết nhãn-nhân sự sai cấu trúc")
     return {
         "ok": True,
         "services": services,
         "labels": labels,
         "links": links,
+        "staff": staff,
+        "staff_labels": staff_labels,
+        "staff_links": staff_links,
     }
 
 
@@ -121,6 +143,40 @@ class ServiceCatalog:
     def set_label_services(self, label_id, service_ids):
         return self.post({"action": "set_label_services", "label_id": str(label_id),
                           "service_ids": list(dict.fromkeys(map(str, service_ids)))[:100]})
+
+    def sync_staff(self, staff):
+        clean = []
+        for item in staff:
+            staff_id = _clean_text(item.get("staff_id"), 64, "Mã nhân sự")
+            clean.append({"staff_id": staff_id})
+        result = []
+        for start in range(0, min(len(clean), 500), 50):
+            response = self.post({"action": "sync_staff", "staff": clean[start:start + 50]})
+            synced = response.get("synced")
+            if not isinstance(synced, int) or synced < 0:
+                raise CatalogError("API trả về kết quả đồng bộ nhân sự sai cấu trúc")
+            result.append(synced)
+        return result
+
+    def create_staff_label(self, name):
+        return self.post({"action": "create_staff_label", "name": _clean_text(name, MAX_LABEL_NAME, "Tên nhãn nhân sự")})
+
+    def rename_staff_label(self, label_id, name):
+        return self.post({"action": "rename_staff_label", "staff_label_id": str(label_id),
+                          "name": _clean_text(name, MAX_LABEL_NAME, "Tên nhãn nhân sự")})
+
+    def delete_staff_label(self, label_id):
+        return self.post({"action": "delete_staff_label", "staff_label_id": str(label_id)})
+
+    def set_label_staff(self, label_id, staff_ids):
+        return self.post({"action": "set_label_staff", "staff_label_id": str(label_id),
+                          "staff_ids": list(dict.fromkeys(map(str, staff_ids)))[:500]})
+
+
+def staff_ids_for_labels(catalog, label_ids):
+    labels = set(map(str, label_ids or []))
+    return {str(link["staff_id"]) for link in catalog.get("staff_links", [])
+            if str(link["staff_label_id"]) in labels}
 
 
 def filter_selected_services(frame, service_ids, selected_label_ids, catalog):

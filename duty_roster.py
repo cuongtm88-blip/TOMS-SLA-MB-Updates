@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,22 @@ VIETNAM = ZoneInfo("Asia/Ho_Chi_Minh")
 
 def normalize(value):
     return " ".join(unicodedata.normalize("NFC", str(value or "")).casefold().split())
+
+
+def staff_key(value):
+    """Return an opaque stable catalog ID without publishing employee codes."""
+    return hashlib.sha256(("TOMS-SLA-MB:" + str(value)).encode("utf-8")).hexdigest()
+
+
+def catalog_staff(rosters):
+    people = {}
+    for roster in rosters.values():
+        for ident, person in roster.get("people", {}).items():
+            staff_id = staff_key(ident)
+            name = str(person.get("name", "")).strip()
+            if name:
+                people[staff_id] = {"staff_id": staff_id, "ten_nhan_su": name}
+    return list(people.values())
 
 
 def read_contacts(path):
@@ -113,12 +130,18 @@ def on_duty(rosters, now=None):
     date = now.date() - timedelta(days=1) if now.hour < 8 else now.date()
     shift = "HC" if 8 <= now.hour < 17 else "Đêm"
     roster = rosters.get(date.strftime("%Y-%m"), {})
-    return [person for person in roster.get("people", {}).values()
+    return [dict(person, staff_id=staff_key(ident))
+            for ident, person in roster.get("people", {}).items()
             if normalize(person["shifts"].get(str(date.day))) == normalize(shift)]
 
 
-def recipients(rosters, contacts, now=None):
+def recipients(rosters, contacts, now=None, staff_ids=None):
     people = on_duty(rosters, now)
+    if staff_ids is not None:
+        allowed = set(map(str, staff_ids))
+        people = [person for person in people if person["staff_id"] in allowed]
+        if not people:
+            return []
     missing = [p["name"] for p in people if normalize(p["name"]) not in contacts]
     if not people:
         raise ValueError("Chưa có lịch/nhân sự cho ca trực hiện tại")

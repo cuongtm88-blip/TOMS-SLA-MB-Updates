@@ -277,7 +277,7 @@ class ATSApp(tk.Tk):
         self.remote_enabled = tk.BooleanVar(value=saved.get("remote_login_enabled", False))
         self.otp_chat_ids = tk.StringVar(value=saved.get("otp_chat_ids", ""))
         self.otp_selector = tk.StringVar(value=saved.get("otp_selector", 'input[placeholder="Mã OTP"]'))
-        self.service_preferences = {key: saved[key] for key in ("service_filter_mode", "selected_service_ids", "selected_service_label_ids") if key in saved}
+        self.service_preferences = {key: saved[key] for key in ("service_filter_mode", "selected_service_ids", "selected_service_label_ids", "selected_staff_label_ids") if key in saved}
         self._remote_config = None
         self._alert_destination = self.destination.get()
         self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
@@ -381,7 +381,19 @@ class ATSApp(tk.Tk):
             if self._alert_destination not in ("Group", "Nhân sự trong ca", "Cả hai"):
                 raise ValueError("Chọn nơi nhận cảnh báo")
             if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
-                duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
+                selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
+                if selected_labels:
+                    catalog = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL).get()
+                    known_labels = {str(item["staff_label_id"]) for item in catalog.get("staff_labels", [])}
+                    if not set(map(str, selected_labels)).issubset(known_labels):
+                        raise ValueError("Danh mục nhãn nhân sự chưa được đồng bộ. Hãy cập nhật Apps Script và kiểm tra lại nút Dịch vụ.")
+                    staff_ids = service_catalog.staff_ids_for_labels(catalog, selected_labels)
+                    duty_roster.recipients(
+                        duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH),
+                        staff_ids=staff_ids,
+                    )
+                else:
+                    duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
             user = self.onebss_user.get().strip()
             password = self.onebss_password.get()
             allowed = _parse_recipient_chat_ids(self.otp_chat_ids.get())
@@ -668,12 +680,22 @@ class ATSApp(tk.Tk):
         result = txl.pd.concat(frames, ignore_index=True).drop_duplicates("ma_bh", keep="last")
         return result.reset_index(drop=True)
 
-    def _send_routed_alerts(self, preprocessing, completion, in_progress, scope_label=None):
+    def _send_routed_alerts(self, preprocessing, completion, in_progress, catalog, scope_label=None):
         destinations = []
         if self._alert_destination in ("Group", "Cả hai"):
             destinations.append((os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"], None))
         if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
-            ids = duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
+            selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
+            known_labels = {str(item["staff_label_id"]) for item in catalog.get("staff_labels", [])}
+            if selected_labels and not set(map(str, selected_labels)).issubset(known_labels):
+                raise RuntimeError("Nhãn nhân sự chưa có trong API Google Sheet. Hãy cập nhật Apps Script rồi mở lại nút Dịch vụ.")
+            staff_ids = service_catalog.staff_ids_for_labels(catalog, selected_labels) if selected_labels else None
+            ids = duty_roster.recipients(
+                duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH),
+                staff_ids=staff_ids,
+            )
+            if selected_labels and not ids:
+                self.write_log("Không có nhân sự trong ca thuộc các nhãn đã chọn; bỏ qua tin nhắn riêng.")
             destinations.extend((ident, ident) for ident in ids)
         failures = []
         for ident, state_recipient in destinations:
@@ -2229,12 +2251,30 @@ class ATSApp(tk.Tk):
                 scope_preprocessing,
                 scope_completion,
                 scope_in_progress,
+                catalog,
                 scope_label,
             )
 
     def _open_service_settings(self):
         client = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL)
-        service_ui.open_service_window(self, client, self.service_preferences, self._save_service_preferences)
+        try:
+            staff = duty_roster.catalog_staff(duty_roster.load(ROSTER_PATH))
+            if staff:
+                catalog = client.get()
+                known_staff = {str(item["staff_id"]) for item in catalog.get("staff", [])}
+                missing_staff = [item for item in staff if item["staff_id"] not in known_staff]
+                if missing_staff:
+                    client.sync_staff(missing_staff)
+            service_ui.open_service_window(
+                self, client, self.service_preferences, self._save_service_preferences,
+                local_staff=staff,
+            )
+        except service_catalog.CatalogError as exc:
+            messagebox.showerror(
+                "Dịch vụ và nhân sự",
+                "Không đồng bộ được danh mục. Hãy cập nhật mã Apps Script theo services_api.gs và triển khai phiên bản mới.\n\n" + str(exc),
+                parent=self,
+            )
 
     def _save_service_preferences(self, value):
         self.service_preferences = value
@@ -2265,9 +2305,17 @@ class ATSApp(tk.Tk):
         return catalog
 
     def _filter_service_frame(self, frame, catalog):
-        if self.service_preferences.get("service_filter_mode", "all") != "custom":
+        mode = self.service_preferences.get("service_filter_mode", "all")
+        label_ids = self.service_preferences.get("selected_service_label_ids", [])
+        service_ids = self.service_preferences.get("selected_service_ids", [])
+        if mode != "custom" and not label_ids:
             return frame
-        return service_catalog.filter_selected_services(frame, self.service_preferences.get("selected_service_ids", []), self.service_preferences.get("selected_service_label_ids", []), catalog)
+        # A stored label always means its membership is the intended filter,
+        # including settings written by older builds where label selection did
+        # not switch the radio mode and all services were saved as explicit IDs.
+        if mode != "custom":
+            service_ids = []
+        return service_catalog.filter_selected_services(frame, service_ids, label_ids, catalog)
 
 
 if __name__ == "__main__":
@@ -2294,7 +2342,26 @@ if __name__ == "__main__":
             raise SystemExit("MB ticket-routing self-test failed")
         catalog = {"services": [{"service_id": "s1", "ten_dich_vu": "MetroNet FE"}],
                    "labels": [{"label_id": "l1", "ten_nhan": "Nhánh 4"}],
-                   "links": [{"label_id": "l1", "service_id": "s1"}]}
+                   "links": [{"label_id": "l1", "service_id": "s1"}],
+                   "staff": [{"staff_id": "person-a", "ten_nhan_su": "Nhân sự A"}],
+                   "staff_labels": [{"staff_label_id": "sl1", "ten_nhan": "Ca MB"}],
+                   "staff_links": [{"staff_label_id": "sl1", "staff_id": "person-a"}]}
+        catalog = service_catalog.validate_catalog({"ok": True, **catalog})
+        if service_catalog.staff_ids_for_labels(catalog, ["sl1"]) != {"person-a"}:
+            raise SystemExit("MB staff-label mapping self-test failed")
+        test_now = txl.datetime(2026, 9, 29, 10, 0, tzinfo=duty_roster.VIETNAM)
+        test_rosters = {"2026-09": {"people": {
+            "employee-a": {"name": "Nhân sự A", "shifts": {"29": "HC"}},
+            "employee-b": {"name": "Nhân sự B", "shifts": {"29": "HC"}},
+        }}}
+        routed = duty_roster.recipients(
+            test_rosters,
+            {"nhân sự a": "1001", "nhân sự b": "1002"},
+            now=test_now,
+            staff_ids={duty_roster.staff_key("employee-a")},
+        )
+        if routed != ["1001"]:
+            raise SystemExit("MB selected staff-label recipient self-test failed")
         service_frame = txl.pd.DataFrame([{"loaihinh_tb": "MetroNet FE"}, {"loaihinh_tb": "Khác"}])
         if len(service_catalog.filter_selected_services(service_frame, [], ["l1"], catalog)) != 1:
             raise SystemExit("MB service-label filtering self-test failed")
