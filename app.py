@@ -86,7 +86,8 @@ MB_PROVINCES = {
         "Hà Giang", "Hà Nam", "Hà Nội", "Hải Dương", "Hải Phòng",
         "Hòa Bình", "Hưng Yên", "Lai Châu", "Lạng Sơn", "Lào Cai",
         "Nam Định", "Ninh Bình", "Phú Thọ", "Quảng Ninh", "Sơn La",
-        "Thái Bình", "Thái Nguyên", "Tuyên Quang", "Vĩnh Phúc", "Yên Bái",
+        "Thanh Hóa", "Thái Bình", "Thái Nguyên", "Tuyên Quang", "Vĩnh Phúc",
+        "Yên Bái", "Nghệ An", "Hà Tĩnh",
     )
 }
 
@@ -2332,6 +2333,10 @@ if __name__ == "__main__":
             raise SystemExit("MB OneBSS scope self-test failed")
         if _parse_repeat_minutes("5") != 5:
             raise SystemExit("5-minute schedule self-test failed")
+        if len(MB_PROVINCES) != 28 or not {
+            duty_roster.normalize(name) for name in ("Thanh Hóa", "Nghệ An", "Hà Tĩnh")
+        }.issubset(MB_PROVINCES):
+            raise SystemExit("MB province mapping self-test failed")
         sample = txl.pd.DataFrame([
             {"ten_nv": "Nhân sự MB", "tentinh": "Tỉnh Cà Mau", "diachi_ld": "Cà Mau"},
             {"ten_nv": "Người khác", "tentinh": "Thành phố Hà Nội", "diachi_ld": "Hà Nội"},

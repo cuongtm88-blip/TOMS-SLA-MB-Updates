@@ -37,6 +37,9 @@ def open_service_window(parent, client, settings, on_save, local_staff=None):
     selectors = ttk.Frame(filter_tab)
     selectors.pack(fill="both", expand=True)
 
+    filter_actions = ttk.Frame(filter_tab)
+    filter_actions.pack(fill="x", pady=(8, 0))
+
     service_box = ttk.LabelFrame(selectors, text="Dịch vụ")
     service_box.pack(side="left", fill="both", expand=True, padx=(0, 6))
     service_list = tk.Listbox(service_box, selectmode="multiple", exportselection=False)
@@ -164,6 +167,8 @@ def open_service_window(parent, client, settings, on_save, local_staff=None):
         staff_links_by_label.setdefault(str(link["staff_label_id"]), set()).add(str(link["staff_id"]))
 
     selected_staff_labels = set(map(str, settings.get("selected_staff_label_ids", [])))
+    staff_actions = ttk.Frame(staff_tab)
+    staff_actions.pack(fill="x", side="bottom", pady=(8, 0))
     staff_filter_box = ttk.LabelFrame(staff_tab, text="Nhân sự đang được gán vào nhãn đã chọn")
     staff_filter_box.pack(side="left", fill="both", expand=True, padx=(0, 6), pady=8)
     staff_filter_list = tk.Listbox(staff_filter_box, exportselection=False)
@@ -217,7 +222,9 @@ def open_service_window(parent, client, settings, on_save, local_staff=None):
     for index, item in enumerate(staff_labels):
         if str(item["staff_label_id"]) in selected_staff_labels:
             staff_filter_labels.select_set(index)
-    on_staff_filter_labels()
+    # Build the personnel rows immediately. Calling only the selection handler
+    # leaves the listbox empty until the online catalog is reloaded.
+    refresh_staff_filter()
 
     ttk.Label(staff_labels_tab, text="Danh sách được đồng bộ từ lịch trực đã nhập. Nhãn nhân sự dùng chung trên các máy; Telegram Chat ID không được tải lên danh mục.").pack(anchor="w")
     staff_manage = ttk.Frame(staff_labels_tab)
@@ -413,9 +420,11 @@ def open_service_window(parent, client, settings, on_save, local_staff=None):
                  "selected_service_label_ids": groups,
                  "selected_staff_label_ids": sorted(selected_staff_labels)}
         on_save(value)
-        window.destroy()
+        messagebox.showinfo("Dịch vụ và nhân sự", "Đã lưu lựa chọn lọc riêng trên máy này.", parent=window)
+
+    ttk.Button(filter_actions, text="Lưu lựa chọn dịch vụ trên máy này", command=save_selection).pack(side="right", padx=4)
+    ttk.Button(staff_actions, text="Lưu lựa chọn nhân sự trên máy này", command=save_selection).pack(side="right", padx=4)
 
     bottom = ttk.Frame(window)
     bottom.pack(fill="x", padx=10, pady=(0, 10))
-    ttk.Button(bottom, text="Lưu lựa chọn trên máy này", command=save_selection).pack(side="right", padx=4)
     ttk.Button(bottom, text="Đóng", command=window.destroy).pack(side="right", padx=4)
