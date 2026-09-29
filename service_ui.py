@@ -25,7 +25,7 @@ def open_service_window(parent, client, settings, on_save):
     notebook.add(labels_tab, text="Quản lý nhãn (dùng chung)")
 
     mode = tk.StringVar(value=settings.get("service_filter_mode", "all"))
-    ttk.Label(filter_tab, text="Chọn tất cả dịch vụ hoặc tự chọn dịch vụ/nhãn cho ứng dụng này.").pack(anchor="w")
+    ttk.Label(filter_tab, text="Dịch vụ được tô sáng gồm dịch vụ chọn trực tiếp và dịch vụ thuộc nhãn đang chọn.").pack(anchor="w")
     modes = ttk.Frame(filter_tab)
     modes.pack(fill="x", pady=6)
     ttk.Radiobutton(modes, text="Tất cả dịch vụ", variable=mode, value="all").pack(side="left", padx=5)
@@ -49,22 +49,59 @@ def open_service_window(parent, client, settings, on_save):
     label_list.pack(side="left", fill="both", expand=True, padx=4, pady=4)
     label_scroll.pack(side="right", fill="y")
 
+    service_ids = [str(item["service_id"]) for item in catalog["services"]]
+    label_ids = [str(item["label_id"]) for item in catalog["labels"]]
+    links_by_label = {}
+    for link in catalog["links"]:
+        links_by_label.setdefault(str(link["label_id"]), set()).add(str(link["service_id"]))
     selected_services = settings.get("selected_service_ids")
+    direct_service_ids = set(map(str, selected_services or []))
+    if selected_services is None and mode.get() == "all":
+        direct_service_ids = set(service_ids)
     selected_labels = set(map(str, settings.get("selected_service_label_ids", [])))
     for item in catalog["services"]:
         service_list.insert("end", item["ten_dich_vu"])
     for item in catalog["labels"]:
         label_list.insert("end", item["ten_nhan"])
-    if selected_services is None and mode.get() == "all":
-        service_list.select_set(0, "end")
-    else:
-        service_ids = set(map(str, selected_services or []))
-        for index, item in enumerate(catalog["services"]):
-            if str(item["service_id"]) in service_ids:
-                service_list.select_set(index)
     for index, item in enumerate(catalog["labels"]):
         if str(item["label_id"]) in selected_labels:
             label_list.select_set(index)
+
+    displayed_service_ids = set()
+    selection_syncing = {"active": False}
+
+    def selected_filter_labels():
+        return {label_ids[index] for index in label_list.curselection()}
+
+    def filter_label_service_ids():
+        labels = selected_filter_labels()
+        return set().union(*(links_by_label.get(label_id, set()) for label_id in labels)) if labels else set()
+
+    def refresh_filter_service_marks():
+        selection_syncing["active"] = True
+        members = filter_label_service_ids()
+        visible = direct_service_ids | members
+        service_list.selection_clear(0, "end")
+        for index, ident in enumerate(service_ids):
+            if ident in visible:
+                service_list.selection_set(index)
+        displayed_service_ids.clear()
+        displayed_service_ids.update(visible)
+        selection_syncing["active"] = False
+
+    def on_filter_service_select(_event=None):
+        if selection_syncing["active"]:
+            return
+        now_selected = {service_ids[index] for index in service_list.curselection()}
+        added = now_selected - displayed_service_ids
+        removed = displayed_service_ids - now_selected
+        direct_service_ids.update(added)
+        direct_service_ids.difference_update(removed - filter_label_service_ids())
+        refresh_filter_service_marks()
+
+    service_list.bind("<<ListboxSelect>>", on_filter_service_select)
+    label_list.bind("<<ListboxSelect>>", lambda _event: refresh_filter_service_marks())
+    refresh_filter_service_marks()
 
     membership = ttk.LabelFrame(labels_tab, text="Dịch vụ thuộc nhãn")
     membership.pack(fill="both", expand=True, pady=(8, 0))
@@ -78,11 +115,6 @@ def open_service_window(parent, client, settings, on_save):
     member_list.configure(yscrollcommand=member_scroll.set)
     member_list.pack(side="left", fill="both", expand=True, padx=4, pady=4)
     member_scroll.pack(side="right", fill="y")
-    label_ids = [str(item["label_id"]) for item in catalog["labels"]]
-    service_ids = [str(item["service_id"]) for item in catalog["services"]]
-    links_by_label = {}
-    for link in catalog["links"]:
-        links_by_label.setdefault(str(link["label_id"]), set()).add(str(link["service_id"]))
     for item in catalog["labels"]:
         managed_labels.insert("end", item["ten_nhan"])
     for item in catalog["services"]:
@@ -101,6 +133,7 @@ def open_service_window(parent, client, settings, on_save):
     def reload_catalog():
         nonlocal catalog, label_ids, service_ids, links_by_label
         try:
+            keep_labels = selected_filter_labels()
             catalog = client.get()
             label_ids = [str(item["label_id"]) for item in catalog["labels"]]
             service_ids = [str(item["service_id"]) for item in catalog["services"]]
@@ -117,6 +150,11 @@ def open_service_window(parent, client, settings, on_save):
             for item in catalog["services"]:
                 member_list.insert("end", item["ten_dich_vu"])
                 service_list.insert("end", item["ten_dich_vu"])
+            direct_service_ids.intersection_update(service_ids)
+            for index, ident in enumerate(label_ids):
+                if ident in keep_labels:
+                    label_list.select_set(index)
+            refresh_filter_service_marks()
         except service_catalog.CatalogError as exc:
             messagebox.showerror("Dịch vụ", str(exc), parent=window)
 
@@ -180,7 +218,7 @@ def open_service_window(parent, client, settings, on_save):
     ttk.Button(manage_buttons, text="Lưu dịch vụ vào nhãn", command=save_members).pack(side="left", padx=3)
 
     def save_selection():
-        ids = [service_ids[index] for index in service_list.curselection()]
+        ids = [ident for ident in service_ids if ident in direct_service_ids]
         groups = [label_ids[index] for index in label_list.curselection()]
         value = {"service_filter_mode": mode.get(), "selected_service_ids": ids,
                  "selected_service_label_ids": groups}
