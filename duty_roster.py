@@ -68,6 +68,41 @@ def read_contacts(path):
         book.close()
 
 
+def read_zalo_contacts(path):
+    """Read optional Zalo IDs from the personnel workbook's Họ và tên / ID Zalo columns."""
+    book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    contacts = {}
+    try:
+        for sheet in book:
+            rows = iter(sheet.iter_rows(values_only=True))
+            for row in rows:
+                labels = [normalize(v) for v in row]
+                if "họ và tên" not in labels:
+                    continue
+                zalo_col = next((i for i, label in enumerate(labels)
+                                 if label in {"id zalo", "zalo chat id", "chat id zalo"}), None)
+                if zalo_col is None:
+                    break
+                name_col = labels.index("họ và tên")
+                for item in rows:
+                    name, ident = item[name_col], item[zalo_col]
+                    if not name or ident is None:
+                        continue
+                    if isinstance(ident, float) and ident.is_integer():
+                        ident = int(ident)
+                    ident = str(ident).strip()
+                    if not ident:
+                        continue
+                    key = normalize(name)
+                    if key in contacts and contacts[key] != ident:
+                        raise ValueError(f"Tên trùng có Zalo Chat ID khác nhau: {name}")
+                    contacts[key] = ident
+                break
+        return contacts
+    finally:
+        book.close()
+
+
 def read_roster(path, year, month):
     days = calendar.monthrange(year, month)[1]
     book = openpyxl.load_workbook(path, read_only=True, data_only=True)

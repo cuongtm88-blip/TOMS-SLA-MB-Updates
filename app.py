@@ -37,6 +37,7 @@ import onebss_grid
 import remote_login
 import service_catalog
 import service_ui
+import zalo_bot
 from config import APP_DATA_ENV, APP_NAME, APP_SLUG, SERVICE_CATALOG_API_URL, TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
 from version import APP_VERSION, DIAGNOSTICS_REPOSITORY, UPDATE_CHECK_INTERVAL_SECONDS
 
@@ -73,8 +74,10 @@ MAX_EXCEL_RECOVERY_ATTEMPTS = 1
 DIAGNOSTICS_DIRNAME = "diagnostics"
 DIAGNOSTICS_CREDENTIAL_SERVICE = f"{APP_SLUG}/github-diagnostics"
 ONEBSS_CREDENTIAL_SERVICE = f"{APP_SLUG}/onebss-login"
+ZALO_CREDENTIAL_SERVICE = f"{APP_SLUG}/zalo-bot"
 ROSTER_PATH = APP_DATA / "duty_rosters.json"
 CONTACTS_PATH = APP_DATA / "duty_contacts.json"
+ZALO_CONTACTS_PATH = APP_DATA / "duty_zalo_contacts.json"
 SEARCH_SCOPES = (
     (("Phòng HTKH Miền Bắc (VIP 1)", "Phòng HTKH Miền Nam (VIP 2)",
       "Phòng HTKH Miền Trung (VIP 3)"),
@@ -119,6 +122,19 @@ def split_mb_ticket_scopes(frame, contacts):
     mb_staff = frame[staff_mask].copy()
     mb_installation = frame[location_mask & ~staff_mask].copy()
     return mb_staff.reset_index(drop=True), mb_installation.reset_index(drop=True)
+
+
+def _zalo_duty_recipients(rosters, contacts, staff_ids=None):
+    people = duty_roster.on_duty(rosters)
+    if staff_ids is not None:
+        allowed = set(map(str, staff_ids))
+        people = [person for person in people if person["staff_id"] in allowed]
+    if not people:
+        raise ValueError("Chưa có nhân sự thuộc nhãn đã chọn trong ca trực hiện tại")
+    missing = [p["name"] for p in people if not contacts.get(duty_roster.normalize(p["name"]))]
+    if missing:
+        raise ValueError("Thiếu Zalo Chat ID: " + ", ".join(missing))
+    return list(dict.fromkeys(contacts[duty_roster.normalize(p["name"])] for p in people))
 
 
 def _load_settings():
@@ -229,9 +245,9 @@ class ATSApp(tk.Tk):
     def __init__(self):
         super().__init__()
         saved = _load_settings()
-        self.title(f"{APP_NAME} - OneBSS → Telegram")
-        self.geometry("900x650")
-        self.minsize(820, 550)
+        self.title(f"{APP_NAME} - OneBSS → Telegram / Zalo")
+        self.geometry("980x700")
+        self.minsize(860, 600)
         self.worker = None
         self.stop_requested = False
         self.auto_repeat = bool(saved.get("schedule_enabled", True))
@@ -250,6 +266,15 @@ class ATSApp(tk.Tk):
         self.telegram_chat_id = tk.StringVar(
             value=os.getenv(TELEGRAM_CHAT_ENV, "") or saved.get("telegram_chat_id", "")
         )
+        self.zalo_token = tk.StringVar(value=credential_store.load_secret(
+            ZALO_CREDENTIAL_SERVICE, "bot-token"
+        ))
+        self._zalo_token_for_alerts = self.zalo_token.get().strip()
+        self._zalo_registration_stop = threading.Event()
+        self._zalo_registration_thread = None
+        self._zalo_registration_seen = set()
+        self._zalo_registration_pending = []
+        self._zalo_registration_started_at_ms = 0
         saved_recipients = _load_recipient_chat_ids(saved.get("error_recipient_chat_ids", []))
         self.error_recipient_chat_ids = tk.StringVar(value=", ".join(saved_recipients))
         self.github_diagnostics_token = tk.StringVar(
@@ -273,6 +298,8 @@ class ATSApp(tk.Tk):
         self.macos_preview = sys.platform == "darwin"
         self.mb_extended = True
         self.destination = tk.StringVar(value=saved.get("alert_destination", "Group"))
+        self.alert_channel = tk.StringVar(value=saved.get("alert_channel", "Telegram"))
+        self._alert_channel = self.alert_channel.get()
         self.onebss_user = tk.StringVar(value=saved.get("onebss_user", ""))
         self.onebss_password = tk.StringVar(value="")
         self.remote_enabled = tk.BooleanVar(value=saved.get("remote_login_enabled", False))
@@ -284,6 +311,8 @@ class ATSApp(tk.Tk):
         self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self._zalo_token_for_alerts:
+            self._start_zalo_registration_listener(self._zalo_token_for_alerts)
         if updater.can_self_update():
             self.after(2500, self._automatic_update_tick)
     def _build_ui(self):
@@ -294,7 +323,7 @@ class ATSApp(tk.Tk):
         self.update_btn = ttk.Button(header, text="Kiểm tra cập nhật", command=lambda: self._start_update_check(silent=False))
         self.update_btn.pack(side="right")
         ttk.Label(header, text=f"Phiên bản {APP_VERSION}").pack(side="right", padx=(0, 10))
-        ttk.Label(self, text=f"Tự động xuất phiếu {APP_NAME} từ OneBSS và gửi cảnh báo Telegram").pack(anchor="w", padx=12)
+        ttk.Label(self, text=f"Tự động xuất phiếu {APP_NAME} từ OneBSS và gửi cảnh báo Telegram/Zalo").pack(anchor="w", padx=12)
 
         box = ttk.LabelFrame(self, text="Thiết lập")
         box.pack(fill="x", **pad)
@@ -331,6 +360,8 @@ class ATSApp(tk.Tk):
         self.github_token_btn.grid(row=4, column=3, sticky="ew", **pad)
         ttk.Label(box, text=f"Gói lỗi tự tải lên repository private: {DIAGNOSTICS_REPOSITORY}").grid(row=5, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
         ttk.Label(box, text=f"Cấu hình Telegram được lưu riêng trên máy này: {SETTINGS_PATH}").grid(row=6, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+        ttk.Label(box, text="Zalo Bot token").grid(row=7, column=0, sticky="w", **pad)
+        ttk.Entry(box, textvariable=self.zalo_token, show="*", width=42).grid(row=7, column=1, columnspan=3, sticky="ew", **pad)
         box.columnconfigure(1, weight=1)
         box.columnconfigure(2, weight=1)
 
@@ -344,6 +375,8 @@ class ATSApp(tk.Tk):
             ).pack(side="left")
             ttk.Button(preview, text="OneBSS / OTP / Lịch trực", command=self._preview_settings).pack(side="right")
             ttk.Combobox(preview, textvariable=self.destination, values=("Group", "Nhân sự trong ca", "Cả hai"), state="readonly", width=18).pack(side="right", padx=8)
+            ttk.Label(preview, text="Kênh cảnh báo:").pack(side="right")
+            ttk.Combobox(preview, textvariable=self.alert_channel, values=("Telegram", "Zalo", "Cả hai"), state="readonly", width=11).pack(side="right", padx=8)
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", **pad)
@@ -379,22 +412,34 @@ class ATSApp(tk.Tk):
     def _prepare_preview_config(self):
         try:
             self._alert_destination = self.destination.get()
+            self._alert_channel = self.alert_channel.get()
             if self._alert_destination not in ("Group", "Nhân sự trong ca", "Cả hai"):
                 raise ValueError("Chọn nơi nhận cảnh báo")
-            if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
+            if self._alert_channel not in ("Telegram", "Zalo", "Cả hai"):
+                raise ValueError("Chọn kênh cảnh báo Telegram, Zalo hoặc Cả hai")
+            need_telegram_staff = self._alert_channel in ("Telegram", "Cả hai") and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
+            need_zalo_staff = self._alert_channel in ("Zalo", "Cả hai")
+            selected_staff_ids = None
+            if need_telegram_staff or need_zalo_staff:
                 selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
                 if selected_labels:
                     catalog = service_catalog.ServiceCatalog(SERVICE_CATALOG_API_URL).get()
                     known_labels = {str(item["staff_label_id"]) for item in catalog.get("staff_labels", [])}
                     if not set(map(str, selected_labels)).issubset(known_labels):
                         raise ValueError("Danh mục nhãn nhân sự chưa được đồng bộ. Hãy cập nhật Apps Script và kiểm tra lại nút Dịch vụ.")
-                    staff_ids = service_catalog.staff_ids_for_labels(catalog, selected_labels)
+                    selected_staff_ids = service_catalog.staff_ids_for_labels(catalog, selected_labels)
+                if need_telegram_staff:
                     duty_roster.recipients(
                         duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH),
-                        staff_ids=staff_ids,
+                        staff_ids=selected_staff_ids,
                     )
-                else:
+                elif self._alert_channel == "Telegram":
                     duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
+                if need_zalo_staff:
+                    _zalo_duty_recipients(
+                        duty_roster.load(ROSTER_PATH), duty_roster.load(ZALO_CONTACTS_PATH),
+                        staff_ids=selected_staff_ids,
+                    )
             user = self.onebss_user.get().strip()
             password = self.onebss_password.get()
             allowed = _parse_recipient_chat_ids(self.otp_chat_ids.get())
@@ -415,7 +460,14 @@ class ATSApp(tk.Tk):
             settings = _load_settings()
             settings.update(onebss_user=user, remote_login_enabled=self.remote_enabled.get(),
                             otp_chat_ids=self.otp_chat_ids.get(), otp_selector=self.otp_selector.get(),
-                            alert_destination=self._alert_destination)
+                            alert_destination=self._alert_destination,
+                            alert_channel=self._alert_channel)
+            zalo_token = self.zalo_token.get().strip()
+            if zalo_token:
+                credential_store.save_secret(ZALO_CREDENTIAL_SERVICE, "bot-token", zalo_token)
+            self._zalo_token_for_alerts = zalo_token
+            if zalo_token:
+                self._start_zalo_registration_listener(zalo_token)
             _save_settings(settings)
             return True
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -454,11 +506,13 @@ class ATSApp(tk.Tk):
         table.rowconfigure(0, weight=1)
         style = ttk.Style(window)
         style.configure("DutyRoster.Treeview", rowheight=30)
-        names = ttk.Treeview(table, columns=("telegram",), show="tree headings", selectmode="browse", style="DutyRoster.Treeview", height=12)
+        names = ttk.Treeview(table, columns=("telegram", "zalo"), show="tree headings", selectmode="browse", style="DutyRoster.Treeview", height=12)
         names.heading("#0", text="Tên nhân sự (cố định)")
         names.column("#0", width=220, minwidth=180, stretch=False)
         names.heading("telegram", text="Telegram Chat ID")
         names.column("telegram", width=145, minwidth=145, stretch=False, anchor="center")
+        names.heading("zalo", text="Zalo Chat ID")
+        names.column("zalo", width=180, minwidth=150, stretch=False, anchor="center")
         names.grid(row=0, column=0, sticky="ns")
         tree = ttk.Treeview(table, show="headings", selectmode="browse", style="DutyRoster.Treeview", height=12)
         tree.grid(row=0, column=1, sticky="nsew")
@@ -496,6 +550,7 @@ class ATSApp(tk.Tk):
                 key = month_key()
                 data = duty_roster.load(ROSTER_PATH).get(key, {})
                 contacts = duty_roster.load(CONTACTS_PATH)
+                zalo_contacts = duty_roster.load(ZALO_CONTACTS_PATH)
                 tree.delete(*tree.get_children())
                 names.delete(*names.get_children())
                 displayed_month[0] = key
@@ -514,7 +569,8 @@ class ATSApp(tk.Tk):
                 for index, (ident, person) in enumerate(data.get("people", {}).items()):
                     tag = "even" if index % 2 == 0 else "odd"
                     chat_id = contacts.get(duty_roster.normalize(person["name"]), "Chưa có ID")
-                    names.insert("", "end", iid=ident, text=person["name"], values=(chat_id,), tags=(tag,))
+                    zalo_id = zalo_contacts.get(duty_roster.normalize(person["name"]), "Chưa có ID")
+                    names.insert("", "end", iid=ident, text=person["name"], values=(chat_id, zalo_id), tags=(tag,))
                     tree.insert("", "end", iid=ident, values=[person["shifts"].get(str(day)) or "–" for day in days], tags=(tag,))
                 if not data.get("people"):
                     selected_person.set("Chưa có lịch tháng này — hãy import lịch Excel")
@@ -528,6 +584,13 @@ class ATSApp(tk.Tk):
             try:
                 if kind == "contacts":
                     duty_roster.save(CONTACTS_PATH, duty_roster.read_contacts(path))
+                    # Preserve locally linked IDs and import an optional Zalo column
+                    # from the same personnel workbook when present.
+                    imported_zalo = duty_roster.read_zalo_contacts(path)
+                    if imported_zalo:
+                        merged_zalo = duty_roster.load(ZALO_CONTACTS_PATH)
+                        merged_zalo.update(imported_zalo)
+                        duty_roster.save(ZALO_CONTACTS_PATH, merged_zalo)
                 else:
                     key = month_key()
                     year, month = map(int, key.split("-"))
@@ -536,12 +599,27 @@ class ATSApp(tk.Tk):
                         return
                     rosters[key] = duty_roster.read_roster(path, year, month)
                     duty_roster.save(ROSTER_PATH, rosters)
+                    if self._zalo_registration_pending:
+                        pending, self._zalo_registration_pending = self._zalo_registration_pending, []
+                        for pending_name, pending_chat_id in pending:
+                            threading.Thread(
+                                target=self._register_zalo_staff,
+                                args=(pending_name, pending_chat_id), daemon=True,
+                            ).start()
                 refresh()
             except Exception as exc:
                 messagebox.showerror("Import lịch/Telegram", str(exc), parent=window)
 
         ttk.Button(tools, text="Import lịch Excel", command=lambda: import_file("roster")).pack(side="left", padx=5)
         ttk.Button(tools, text="Import ID Telegram", command=lambda: import_file("contacts")).pack(side="left", padx=5)
+        def link_zalo_to_selected():
+            ident = active_person[0]
+            if not ident or not names.exists(ident):
+                messagebox.showinfo("Liên kết Zalo", "Hãy chọn nhân sự trong bảng trước.", parent=window)
+                return
+            self._fetch_zalo_chats_for_staff(names.item(ident, "text"), window, refresh)
+
+        ttk.Button(tools, text="Gán ID Zalo cho nhân sự chọn", command=link_zalo_to_selected).pack(side="left", padx=5)
         ttk.Button(tools, text="Xem tháng", command=refresh).pack(side="left", padx=5)
         editor = ttk.Frame(window)
         editor.pack(fill="x", padx=10, pady=8)
@@ -683,23 +761,37 @@ class ATSApp(tk.Tk):
 
     def _send_routed_alerts(self, preprocessing, completion, in_progress, catalog, scope_label=None):
         destinations = []
-        if self._alert_destination in ("Group", "Cả hai"):
-            destinations.append((os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"], None))
-        if self._alert_destination in ("Nhân sự trong ca", "Cả hai"):
+        channel_mode = getattr(self, "_alert_channel", None)
+        if channel_mode not in ("Telegram", "Zalo", "Cả hai"):
+            channel_mode = "Telegram"
+        use_telegram = channel_mode in ("Telegram", "Cả hai")
+        use_zalo = channel_mode in ("Zalo", "Cả hai")
+        if use_telegram and self._alert_destination in ("Group", "Cả hai"):
+            destinations.append(("telegram", os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"], None))
+        need_telegram_staff = use_telegram and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
+        need_zalo_staff = use_zalo
+        if need_telegram_staff or need_zalo_staff:
             selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
             known_labels = {str(item["staff_label_id"]) for item in catalog.get("staff_labels", [])}
             if selected_labels and not set(map(str, selected_labels)).issubset(known_labels):
                 raise RuntimeError("Nhãn nhân sự chưa có trong API Google Sheet. Hãy cập nhật Apps Script rồi mở lại nút Dịch vụ.")
             staff_ids = service_catalog.staff_ids_for_labels(catalog, selected_labels) if selected_labels else None
+        if need_telegram_staff:
             ids = duty_roster.recipients(
                 duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH),
                 staff_ids=staff_ids,
             )
             if selected_labels and not ids:
                 self.write_log("Không có nhân sự trong ca thuộc các nhãn đã chọn; bỏ qua tin nhắn riêng.")
-            destinations.extend((ident, ident) for ident in ids)
+            destinations.extend(("telegram", ident, ident) for ident in ids)
+        if need_zalo_staff:
+            ids = _zalo_duty_recipients(
+                duty_roster.load(ROSTER_PATH), duty_roster.load(ZALO_CONTACTS_PATH),
+                staff_ids=staff_ids,
+            )
+            destinations.extend(("zalo", ident, "zalo:" + ident) for ident in ids)
         failures = []
-        for ident, state_recipient in destinations:
+        for channel, ident, state_recipient in destinations:
             for frame, builder in ((preprocessing, txl.build_bh_message), (completion, txl.build_completion_message),
                                    (in_progress, txl.build_in_progress_message)):
                 operational = builder is txl.build_in_progress_message
@@ -721,21 +813,24 @@ class ATSApp(tk.Tk):
                                 "</b>\n<i>Phạm vi: " + html.escape(scope_label) + "</i>",
                                 1,
                             )
-                        txl.send_telegram_message(message, chat_id=ident, bot_token=self._telegram_token_for_alerts)
+                        if channel == "zalo":
+                            zalo_bot.send_message(self._zalo_token_for_alerts, ident, message)
+                        else:
+                            txl.send_telegram_message(message, chat_id=ident, bot_token=self._telegram_token_for_alerts)
                         if operational:
                             _, milestone = _get_new_in_progress_alerts(ticket, state_recipient)
                             _record_in_progress_alerts(milestone)
-                        for _ in range(31 if ident.startswith("-") else 11):
+                        for _ in range(31 if channel == "telegram" and ident.startswith("-") else 11):
                             if self.stop_requested:
                                 return
                             time.sleep(0.1)
                     except Exception:
                         failures.append(ident)
-                        self.write_log(f"Gửi cảnh báo tới Chat ID {ident} chưa thành công; không ghi nhận mốc chưa gửi.")
+                        self.write_log(f"Gửi cảnh báo {channel} tới Chat ID {ident} chưa thành công; không ghi nhận mốc chưa gửi.")
                         break
         if failures:
-            raise RuntimeError("Có người nhận Telegram chưa nhận được cảnh báo. Kiểm tra Chat ID, quyền bot và Start bot.")
-        self.write_log(f"Đã xử lý cảnh báo cho {len(destinations)} nơi nhận; chỉ gửi mốc mới của phiếu đang thực hiện.")
+            raise RuntimeError("Có người nhận chưa nhận được cảnh báo. Kiểm tra đúng Chat ID, quyền bot và việc người nhận đã mở cuộc trò chuyện với bot.")
+        self.write_log(f"Đã xử lý cảnh báo qua {channel_mode} cho {len(destinations)} nơi nhận; chỉ gửi mốc mới của phiếu đang thực hiện.")
 
     def write_log(self, text):
         self.after(0, self._append_log, text)
@@ -785,6 +880,7 @@ class ATSApp(tk.Tk):
 
     def _on_close(self):
         """Release the temporary no-sleep request before the UI exits."""
+        self._zalo_registration_stop.set()
         self.request_stop()
         self._release_keep_awake()
         self.destroy()
@@ -1069,7 +1165,7 @@ class ATSApp(tk.Tk):
         os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"] = self.telegram_chat_id.get().strip()
         if self.mb_extended and not self._prepare_preview_config():
             return
-        if self._error_recipient_ids and not self._telegram_token_for_alerts:
+        if self._error_recipient_ids and not self._telegram_token_for_alerts and self.alert_channel.get() != "Zalo":
             messagebox.showerror(
                 "Thiếu Telegram Bot token",
                 "Cần nhập Telegram Bot token để gửi cảnh báo lỗi riêng.",
@@ -1094,7 +1190,9 @@ class ATSApp(tk.Tk):
             if self.start_event:
                 if not self._apply_telegram_config():
                     return
-                if self._alert_destination != "Nhân sự trong ca" and not self._validate_telegram_group():
+                if (self._alert_channel in ("Telegram", "Cả hai")
+                        and self._alert_destination in ("Group", "Cả hai")
+                        and not self._validate_telegram_group()):
                     return
                 self.run_btn.configure(state="disabled")
                 self.write_log("Bắt đầu bước 2: cấu hình OneBSS và chạy quy trình...")
@@ -1129,11 +1227,24 @@ class ATSApp(tk.Tk):
     def _apply_telegram_config(self):
         token = self.telegram_token.get().strip()
         chat_id = self.telegram_chat_id.get().strip()
-        if not token or (not chat_id and self.destination.get() != "Nhân sự trong ca"):
+        channel = self.alert_channel.get()
+        use_telegram = channel in ("Telegram", "Cả hai")
+        use_zalo = channel in ("Zalo", "Cả hai")
+        if channel not in ("Telegram", "Zalo", "Cả hai"):
             messagebox.showerror(
-                "Thiếu cấu hình Telegram",
-                "Hãy nhập Telegram Bot token và Group chat ID trước khi chạy.",
+                "Thiếu kênh cảnh báo",
+                "Chọn Telegram, Zalo hoặc Cả hai.",
             )
+            return False
+        if use_telegram and not token:
+            messagebox.showerror("Thiếu cấu hình Telegram", "Kênh đã chọn cần Telegram Bot token.")
+            return False
+        if use_telegram and not chat_id and self.destination.get() in ("Group", "Cả hai"):
+            messagebox.showerror("Thiếu cấu hình Telegram", "Kênh Telegram cần Group chat ID theo nơi nhận đã chọn.")
+            return False
+        zalo_token = self.zalo_token.get().strip()
+        if use_zalo and not zalo_token:
+            messagebox.showerror("Thiếu cấu hình Zalo", "Nhập Zalo Bot token để gửi riêng cho nhân sự trực.")
             return False
         try:
             error_recipient_ids = _parse_recipient_chat_ids(
@@ -1154,28 +1265,36 @@ class ATSApp(tk.Tk):
             return False
         self.repeat_seconds = interval_minutes * 60
         self._telegram_token_for_alerts = token
+        self._alert_channel = channel
+        self._zalo_token_for_alerts = zalo_token
         self._error_recipient_ids = error_recipient_ids
-        os.environ["TXL_TELEGRAM_BOT_TOKEN"] = token
+        if token:
+            os.environ["TXL_TELEGRAM_BOT_TOKEN"] = token
         os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"] = chat_id
-        os.environ[TELEGRAM_TOKEN_ENV] = token
+        if token:
+            os.environ[TELEGRAM_TOKEN_ENV] = token
         os.environ[TELEGRAM_CHAT_ENV] = chat_id
         try:
+            if zalo_token:
+                credential_store.save_secret(ZALO_CREDENTIAL_SERVICE, "bot-token", zalo_token)
             _save_settings({**_load_settings(),
                 "telegram_token": token,
                 "telegram_chat_id": chat_id,
+                "alert_channel": channel,
+                "alert_destination": self.destination.get(),
                 "error_recipient_chat_ids": error_recipient_ids,
                 "schedule_enabled": self.auto_repeat,
                 "repeat_minutes": interval_minutes,
                 "keep_awake_enabled": bool(self.keep_awake_enabled.get()),
             })
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError):
             messagebox.showerror(
                 "Không lưu được cấu hình",
-                f"Không thể lưu cấu hình trên máy này: {exc}",
+                "Không thể lưu cấu hình an toàn trên máy này.",
             )
             return False
         self.write_log(
-            f"Đã lưu cấu hình; chu kỳ lặp là {interval_minutes} phút; "
+            f"Đã lưu cấu hình kênh {channel}; chu kỳ lặp là {interval_minutes} phút; "
             f"có {len(error_recipient_ids)} người nhận cảnh báo lỗi."
         )
         return True
@@ -1274,6 +1393,186 @@ class ATSApp(tk.Tk):
             )
         finally:
             self.after(0, lambda: self.fetch_chat_btn.configure(state="normal"))
+
+    def _fetch_zalo_chats_for_staff(self, staff_name, parent, refresh):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Zalo", "Hãy dừng quy trình trước khi lấy ID Zalo.", parent=parent)
+            return
+        token = self.zalo_token.get().strip()
+        if not token:
+            messagebox.showerror("Thiếu Zalo Bot token", "Nhập Zalo Bot token ở cửa sổ chính trước.", parent=parent)
+            return
+        try:
+            credential_store.save_secret(ZALO_CREDENTIAL_SERVICE, "bot-token", token)
+        except (OSError, subprocess.SubprocessError):
+            messagebox.showerror("Zalo Bot token", "Không lưu được token an toàn trên máy này.", parent=parent)
+            return
+        self.write_log("Đang tìm người vừa nhắn tin riêng cho Zalo Bot...")
+        threading.Thread(
+            target=self._fetch_zalo_chats_worker,
+            args=(token, staff_name, parent, refresh),
+            daemon=True,
+        ).start()
+
+    def _fetch_zalo_chats_worker(self, token, staff_name, parent, refresh):
+        try:
+            updates = zalo_bot.fetch_updates(token)
+            self._process_zalo_registration_updates(updates)
+            chats = zalo_bot.private_chats_from_updates(updates)
+            self.after(0, lambda chats=chats: self._show_zalo_chat_picker(chats, staff_name, parent, refresh))
+        except Exception as exc:
+            error_text = str(exc)
+            self.write_log(f"Không lấy được danh sách Zalo: {error_text}")
+            self.after(0, lambda error_text=error_text: messagebox.showerror("Lấy Zalo Chat ID", error_text, parent=parent))
+
+    def _start_zalo_registration_listener(self, token):
+        if not token or (self._zalo_registration_thread and self._zalo_registration_thread.is_alive()):
+            return
+        self._zalo_registration_stop.clear()
+        self._zalo_registration_started_at_ms = int(time.time() * 1000)
+        self._zalo_registration_thread = threading.Thread(
+            target=self._zalo_registration_loop,
+            args=(token,),
+            daemon=True,
+        )
+        self._zalo_registration_thread.start()
+        self.write_log("Đã bật tiếp nhận đăng ký ID Zalo tự động; gửi tin riêng theo cú pháp ‘Họ và tên đăng ký nhận cảnh báo’.")
+
+    def _zalo_registration_loop(self, token):
+        last_error_log = 0.0
+        while not self._zalo_registration_stop.is_set():
+            try:
+                updates = zalo_bot.fetch_updates(token, timeout=10)
+                self._process_zalo_registration_updates(updates)
+            except Exception as exc:
+                now = time.monotonic()
+                if now - last_error_log >= 60:
+                    self.write_log(f"Không thể đọc đăng ký Zalo tự động: {exc}")
+                    last_error_log = now
+                self._zalo_registration_stop.wait(10)
+
+    def _process_zalo_registration_updates(self, updates):
+        for update in updates:
+            details = zalo_bot.private_message_details(update)
+            if details is None:
+                continue
+            chat_id, text, message_time, update_key = details
+            if not message_time or message_time < self._zalo_registration_started_at_ms:
+                continue
+            dedupe_key = update_key or f"{chat_id}:{message_time}:{text}"
+            if dedupe_key in self._zalo_registration_seen:
+                continue
+            self._zalo_registration_seen.add(dedupe_key)
+            if len(self._zalo_registration_seen) > 1000:
+                self._zalo_registration_seen.clear()
+            name = zalo_bot.registration_name(text)
+            if name:
+                self._register_zalo_staff(name, chat_id)
+
+    def _register_zalo_staff(self, submitted_name, chat_id):
+        """Bind a new Zalo private chat to one exact employee name in local data."""
+        name_key = duty_roster.normalize(submitted_name)
+        people_by_name = {}
+        rosters = duty_roster.load(ROSTER_PATH)
+        if not rosters:
+            pending_item = (submitted_name, str(chat_id))
+            if pending_item not in self._zalo_registration_pending:
+                self._zalo_registration_pending.append(pending_item)
+            self.write_log(f"Đã nhận đăng ký Zalo của {submitted_name}; chờ import lịch trực để đối chiếu nhân sự.")
+            return
+        for person in duty_roster.catalog_staff(rosters):
+            person_name = str(person.get("ten_nhan_su", "")).strip()
+            if person_name:
+                people_by_name.setdefault(duty_roster.normalize(person_name), {})[
+                    str(person.get("staff_id") or person_name)
+                ] = person_name
+        matches = people_by_name.get(name_key, {})
+        if len(matches) != 1:
+            self.write_log(f"Bỏ qua đăng ký Zalo ‘{submitted_name}’: tên không khớp duy nhất với nhân sự trong lịch đã import.")
+            try:
+                zalo_bot.send_message(
+                    self._zalo_token_for_alerts, chat_id,
+                    "Chưa ghép được ID Zalo. Hãy gửi đúng họ tên như trong lịch trực theo cú pháp: Họ Và Tên đăng ký nhận cảnh báo.",
+                )
+            except Exception as exc:
+                self.write_log(f"Không gửi được phản hồi đăng ký Zalo: {exc}")
+            return
+        employee_name = next(iter(matches.values()))
+        contacts = duty_roster.load(ZALO_CONTACTS_PATH)
+        normalized_name = duty_roster.normalize(employee_name)
+        owner = next((name for name, value in contacts.items()
+                      if str(value) == str(chat_id) and duty_roster.normalize(name) != normalized_name), None)
+        if owner:
+            self.write_log(f"Từ chối đăng ký Zalo của {employee_name}: Chat ID đã thuộc một nhân sự khác.")
+            try:
+                zalo_bot.send_message(
+                    self._zalo_token_for_alerts, chat_id,
+                    "ID Zalo này đã được gán cho nhân sự khác. Vui lòng liên hệ quản trị viên để kiểm tra.",
+                )
+            except Exception as exc:
+                self.write_log(f"Không gửi được phản hồi đăng ký Zalo: {exc}")
+            return
+        contacts[normalized_name] = str(chat_id)
+        try:
+            duty_roster.save(ZALO_CONTACTS_PATH, contacts)
+        except OSError as exc:
+            self.write_log(f"Không lưu được ID Zalo của {employee_name}: {exc}")
+            return
+        self.write_log(f"Đã tự động gán Zalo Chat ID cho nhân sự {employee_name}.")
+        try:
+            zalo_bot.send_message(
+                self._zalo_token_for_alerts, chat_id,
+                f"Đăng ký nhận cảnh báo thành công. Tài khoản Zalo đã được gán cho nhân sự {employee_name}.",
+            )
+        except Exception as exc:
+            self.write_log(f"Đã lưu ID Zalo nhưng không gửi được xác nhận cho {employee_name}: {exc}")
+
+    def _show_zalo_chat_picker(self, chats, staff_name, parent, refresh):
+        if not chats:
+            messagebox.showinfo(
+                "Chưa tìm thấy người dùng Zalo",
+                f"Chưa nhận được tin nhắn đến bot. Nhân sự {staff_name} cần mở bot, gửi một tin nhắn riêng, "
+                "sau đó chọn lại nhân sự và bấm Gán ID Zalo lần nữa. Nếu bot đã cấu hình webhook, getUpdates có thể không dùng được.",
+                parent=parent,
+            )
+            return
+        dialog = tk.Toplevel(parent)
+        dialog.title(f"Gán Zalo Chat ID — {staff_name}")
+        dialog.geometry("600x360")
+        dialog.transient(parent)
+        dialog.grab_set()
+        ttk.Label(dialog, text=f"Nhân sự được chọn: {staff_name}. Chọn đúng tài khoản vừa nhắn tin cho bot.").pack(anchor="w", padx=14, pady=(14, 8))
+        listbox = tk.Listbox(dialog, selectmode="browse", exportselection=False)
+        listbox.pack(fill="both", expand=True, padx=14, pady=8)
+        for chat in chats:
+            listbox.insert("end", f'{chat["name"]} — Zalo Chat ID: {chat["id"]}')
+        listbox.selection_set(0)
+
+        def save_selected():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Chưa chọn tài khoản", "Chọn tài khoản Zalo cần liên kết.", parent=dialog)
+                return
+            chat = chats[selection[0]]
+            contacts = duty_roster.load(ZALO_CONTACTS_PATH)
+            owner = next((name for name, value in contacts.items() if value == chat["id"] and name != duty_roster.normalize(staff_name)), None)
+            if owner:
+                messagebox.showerror("ID đã được gán", "Chat ID này đã gắn với một nhân sự khác. Kiểm tra danh bạ trước khi đổi.", parent=dialog)
+                return
+            contacts[duty_roster.normalize(staff_name)] = chat["id"]
+            try:
+                duty_roster.save(ZALO_CONTACTS_PATH, contacts)
+            except OSError as exc:
+                messagebox.showerror("Không lưu được", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            refresh()
+            self.write_log(f'Đã gán Zalo Chat ID cho nhân sự {staff_name}.')
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(0, 14))
+        ttk.Button(buttons, text="Hủy", command=dialog.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(buttons, text="Gán cho nhân sự", command=save_selected).pack(side="right")
 
     def _show_private_chat_picker(self, chats):
         if not chats:
