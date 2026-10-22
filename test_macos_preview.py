@@ -317,7 +317,10 @@ class PreviewTests(unittest.TestCase):
         instance = app.ATSApp.__new__(app.ATSApp)
         instance._zalo_token_for_alerts = "test-token"
         logs = []
+        refreshed = []
         instance.write_log = logs.append
+        instance._duty_roster_refresh_callback = lambda: refreshed.append(True)
+        instance.after = lambda _delay, callback: callback()
         with tempfile.TemporaryDirectory() as folder:
             roster_path = Path(folder) / "rosters.json"
             contacts_path = Path(folder) / "zalo.json"
@@ -331,8 +334,24 @@ class PreviewTests(unittest.TestCase):
                 self.assertEqual(roster.load(contacts_path), {roster.normalize("Đỗ Đức Anh"): "zalo.chat.1"})
                 send.assert_called_once()
                 self.assertTrue(any("Đã tự động gán" in line for line in logs))
+                self.assertEqual(refreshed, [True])
                 instance._register_zalo_staff("Đỗ Đức", "zalo.chat.2")
                 self.assertNotIn(roster.normalize("Đỗ Đức"), roster.load(contacts_path))
+
+    def test_zalo_manual_assignment_skips_poll_when_staff_already_linked(self):
+        instance = app.ATSApp.__new__(app.ATSApp)
+        instance.worker = None
+        instance.zalo_token = type("Value", (), {"get": lambda _self: "test-token"})()
+        refreshed = []
+        with patch.object(roster, "load", return_value={roster.normalize("Phạm Anh Huy"): "zalo.chat.1"}), \
+             patch.object(app.messagebox, "showinfo") as showinfo, \
+             patch.object(instance, "_start_zalo_registration_listener") as start_listener, \
+             patch.object(app.threading, "Thread") as thread:
+            instance._fetch_zalo_chats_for_staff("Phạm Anh Huy", None, lambda: refreshed.append(True))
+        self.assertEqual(refreshed, [True])
+        showinfo.assert_called_once()
+        start_listener.assert_not_called()
+        thread.assert_not_called()
 
     def test_zalo_id_import_optional_column_and_duty_routing(self):
         with tempfile.TemporaryDirectory() as folder:
