@@ -612,6 +612,15 @@ class ATSApp(tk.Tk):
             except ValueError:
                 messagebox.showerror("Lịch trực", "Nhập tháng dạng YYYY-MM, ví dụ 2026-10", parent=window)
 
+        self._duty_roster_refresh_callback = refresh
+
+        def close_roster_window():
+            if getattr(self, "_duty_roster_refresh_callback", None) is refresh:
+                self._duty_roster_refresh_callback = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_roster_window)
+
         def import_file(kind):
             path = filedialog.askopenfilename(parent=window, filetypes=[("Excel", "*.xlsx")])
             if not path:
@@ -1504,6 +1513,15 @@ class ATSApp(tk.Tk):
         if not token:
             messagebox.showerror("Thiếu Zalo Bot token", "Nhập Zalo Bot token ở cửa sổ chính trước.", parent=parent)
             return
+        existing_id = duty_roster.load(ZALO_CONTACTS_PATH).get(duty_roster.normalize(staff_name))
+        if existing_id:
+            refresh()
+            messagebox.showinfo(
+                "Zalo Chat ID đã được gán",
+                f"{staff_name} đã có Zalo Chat ID. Không cần lấy lại từ getUpdates.",
+                parent=parent,
+            )
+            return
         try:
             credential_store.save_secret(ZALO_CREDENTIAL_SERVICE, "bot-token", token)
         except (OSError, subprocess.SubprocessError):
@@ -1703,6 +1721,12 @@ class ATSApp(tk.Tk):
             self.write_log(f"Không lưu được ID Zalo của {employee_name}: {exc}")
             return
         self.write_log(f"Đã tự động gán Zalo Chat ID cho nhân sự {employee_name}.")
+        refresh_roster = getattr(self, "_duty_roster_refresh_callback", None)
+        if callable(refresh_roster):
+            try:
+                self.after(0, refresh_roster)
+            except tk.TclError:
+                pass
         try:
             zalo_bot.send_message(
                 self._zalo_token_for_alerts, chat_id,
