@@ -284,6 +284,9 @@ class ATSApp(tk.Tk):
         self._zalo_registration_seen = set()
         self._zalo_registration_pending = []
         self._zalo_registration_started_at_ms = 0
+        self._zalo_group_chats = {}
+        self._zalo_group_chats_lock = threading.Lock()
+        self._zalo_group_seen = threading.Event()
         saved_recipients = _load_recipient_chat_ids(saved.get("error_recipient_chat_ids", []))
         self.error_recipient_chat_ids = tk.StringVar(value=", ".join(saved_recipients))
         self.github_diagnostics_token = tk.StringVar(
@@ -1531,7 +1534,12 @@ class ATSApp(tk.Tk):
         try:
             updates = zalo_bot.fetch_updates(token)
             self._process_zalo_registration_updates(updates)
-            groups = zalo_bot.group_chats_from_updates(updates)
+            groups = self._zalo_groups_from_updates(updates)
+            if not groups:
+                # The background registration poller may own getUpdates and
+                # receive the group event first. Give it a chance to cache it.
+                self._zalo_group_seen.wait(12)
+                groups = self._zalo_groups_from_updates(updates)
             self.after(0, lambda groups=groups: self._show_zalo_group_picker(groups))
         except Exception as exc:
             error_text = str(exc)
@@ -1539,6 +1547,14 @@ class ATSApp(tk.Tk):
             self.after(0, lambda error_text=error_text: messagebox.showerror("Lấy Group ID Zalo", error_text))
         finally:
             self.after(0, lambda: self.fetch_chat_btn.configure(state="normal"))
+
+    def _zalo_groups_from_updates(self, updates=()):
+        groups = {item["id"]: item for item in zalo_bot.group_chats_from_updates(updates)}
+        lock = getattr(self, "_zalo_group_chats_lock", None)
+        if lock is not None:
+            with lock:
+                groups.update(getattr(self, "_zalo_group_chats", {}))
+        return list(groups.values())
 
     def _show_zalo_group_picker(self, groups):
         if not groups:
@@ -1612,6 +1628,15 @@ class ATSApp(tk.Tk):
 
     def _process_zalo_registration_updates(self, updates):
         for update in updates:
+            groups = zalo_bot.group_chats_from_updates([update])
+            if groups:
+                lock = getattr(self, "_zalo_group_chats_lock", None)
+                if lock is not None:
+                    with lock:
+                        self._zalo_group_chats.update({item["id"]: item for item in groups})
+                event = getattr(self, "_zalo_group_seen", None)
+                if event is not None:
+                    event.set()
             details = zalo_bot.private_message_details(update)
             if details is None:
                 continue

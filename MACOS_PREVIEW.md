@@ -1,4 +1,4 @@
-# MB macOS — phiên bản 1.0.13
+# MB macOS — phiên bản 1.0.14
 
 Bản phát hành này dùng chung mã tính năng MB cho macOS và Windows. Bộ cài
 Windows và gói macOS được phát hành riêng trong cùng đợt.
@@ -14,8 +14,8 @@ cd /Users/tranmanhcuong/Projects/TOMS_SLA/TOMS_SLA_MB
 .venv/bin/python app.py
 ```
 
-Giao diện có dòng `Phiên bản 1.0.12`, nút `OneBSS / OTP / Lịch trực` và lựa
-chọn kênh cảnh báo. Đây là pre-release macOS; không thay đổi bản Windows ổn định.
+Giao diện có nút `OneBSS / OTP / Lịch trực` và lựa chọn kênh cảnh báo. Bản
+macOS và Windows được phát hành chung số phiên bản, với gói cài riêng.
 
 ## Đọc bảng thay vì tải Excel
 

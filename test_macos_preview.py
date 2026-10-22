@@ -366,6 +366,25 @@ class PreviewTests(unittest.TestCase):
             [{"id": "group-1", "name": "Nhóm thử"}],
         )
 
+    def test_zalo_registration_listener_preserves_group_updates_for_id_lookup(self):
+        instance = app.ATSApp.__new__(app.ATSApp)
+        instance._zalo_group_chats = {}
+        instance._zalo_group_chats_lock = app.threading.Lock()
+        instance._zalo_group_seen = app.threading.Event()
+        instance._zalo_registration_seen = set()
+        instance._zalo_registration_started_at_ms = 0
+        instance._register_zalo_staff = Mock()
+
+        update = {"message": {"chat": {"id": "group-1", "type": "group", "title": "Nhóm thử"}}}
+        app.ATSApp._process_zalo_registration_updates(instance, [update])
+
+        self.assertEqual(
+            app.ATSApp._zalo_groups_from_updates(instance),
+            [{"id": "group-1", "name": "Nhóm thử"}],
+        )
+        self.assertTrue(instance._zalo_group_seen.is_set())
+        instance._register_zalo_staff.assert_not_called()
+
     def test_zalo_group_alert_runs_with_incomplete_staff_ids(self):
         frame = grid.parse(snapshot())
         frame["sla_bh"] = "10 ≤ TXL ≤ 20"
