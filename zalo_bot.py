@@ -43,7 +43,14 @@ def fetch_updates(token, timeout=5, session=requests):
             )
     except requests.RequestException:
         raise RuntimeError("Không kết nối được Zalo Bot API; hãy kiểm tra mạng và thử lại.") from None
-    result = _response_payload(response, token)
+    try:
+        result = _response_payload(response, token)
+    except RuntimeError as exc:
+        # getUpdates is a long-poll endpoint; the API can report its normal
+        # empty-poll timeout as an error payload instead of an empty result.
+        if str(exc).casefold() == "zalo bot api: request timeout":
+            return []
+        raise
     if isinstance(result, dict):
         return result.get("updates") or result.get("result") or [result]
     return result if isinstance(result, list) else []
@@ -120,6 +127,27 @@ def private_chats_from_updates(updates):
             or "Người dùng Zalo"
         ).strip()
         chats.setdefault(chat_id, {"id": chat_id, "name": name})
+    return list(chats.values())
+
+
+def group_chats_from_updates(updates):
+    """Extract group conversations exposed by a bot mention/reply update."""
+    chats = {}
+    for update in reversed(updates):
+        message = update_message(update)
+        chat = message.get("chat") or {}
+        if not isinstance(chat, dict):
+            continue
+        chat_type = str(chat.get("type") or chat.get("chat_type") or "").casefold()
+        chat_id = chat.get("id") or chat.get("chat_id")
+        if chat_type not in {"group", "supergroup", "group_chat"} or chat_id is None:
+            continue
+        ident = str(chat_id).strip()
+        if ident:
+            chats.setdefault(ident, {
+                "id": ident,
+                "name": str(chat.get("title") or chat.get("name") or "Nhóm Zalo"),
+            })
     return list(chats.values())
 
 

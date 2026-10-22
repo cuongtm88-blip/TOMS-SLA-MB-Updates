@@ -184,7 +184,6 @@ def open_service_window(parent, client, settings, on_save, local_staff=None):
     staff_filter_labels.pack(side="left", fill="both", expand=True, padx=4, pady=4)
     staff_label_scroll.pack(side="right", fill="y")
     ttk.Label(staff_tab, text="Khi không chọn nhãn, gửi riêng cho toàn bộ nhân sự đang trực. Nhãn chỉ giới hạn người nhận riêng; Group vẫn nhận theo cấu hình.").pack(anchor="w", before=staff_filter_box)
-
     def refresh_staff_filter():
         staff_filter_list.delete(0, "end")
         staff_filter_labels.delete(0, "end")

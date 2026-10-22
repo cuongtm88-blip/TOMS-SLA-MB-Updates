@@ -35,6 +35,7 @@ import updater
 import duty_roster
 import onebss_grid
 import remote_login
+import remote_resume
 import service_catalog
 import service_ui
 import zalo_bot
@@ -78,6 +79,9 @@ ZALO_CREDENTIAL_SERVICE = f"{APP_SLUG}/zalo-bot"
 ROSTER_PATH = APP_DATA / "duty_rosters.json"
 CONTACTS_PATH = APP_DATA / "duty_contacts.json"
 ZALO_CONTACTS_PATH = APP_DATA / "duty_zalo_contacts.json"
+REMOTE_WORKFLOW_STATE_PATH = APP_DATA / "remote-workflow.json"
+REMOTE_GUI_PID_PATH = APP_DATA / "remote-gui.pid"
+REMOTE_RESUME_REQUEST_PATH = APP_DATA / "remote-resume.json"
 SEARCH_SCOPES = (
     (("Phòng HTKH Miền Bắc (VIP 1)", "Phòng HTKH Miền Nam (VIP 2)",
       "Phòng HTKH Miền Trung (VIP 3)"),
@@ -124,7 +128,7 @@ def split_mb_ticket_scopes(frame, contacts):
     return mb_staff.reset_index(drop=True), mb_installation.reset_index(drop=True)
 
 
-def _zalo_duty_recipients(rosters, contacts, staff_ids=None):
+def _zalo_duty_recipients(rosters, contacts, staff_ids=None, allow_missing=False, missing_names=None):
     people = duty_roster.on_duty(rosters)
     if staff_ids is not None:
         allowed = set(map(str, staff_ids))
@@ -132,9 +136,14 @@ def _zalo_duty_recipients(rosters, contacts, staff_ids=None):
     if not people:
         raise ValueError("Chưa có nhân sự thuộc nhãn đã chọn trong ca trực hiện tại")
     missing = [p["name"] for p in people if not contacts.get(duty_roster.normalize(p["name"]))]
-    if missing:
+    if missing_names is not None:
+        missing_names.extend(missing)
+    if missing and not allow_missing:
         raise ValueError("Thiếu Zalo Chat ID: " + ", ".join(missing))
-    return list(dict.fromkeys(contacts[duty_roster.normalize(p["name"])] for p in people))
+    return list(dict.fromkeys(
+        contacts[duty_roster.normalize(p["name"])]
+        for p in people if contacts.get(duty_roster.normalize(p["name"]))
+    ))
 
 
 def _load_settings():
@@ -299,6 +308,7 @@ class ATSApp(tk.Tk):
         self.mb_extended = True
         self.destination = tk.StringVar(value=saved.get("alert_destination", "Group"))
         self.alert_channel = tk.StringVar(value=saved.get("alert_channel", "Telegram"))
+        self.zalo_group_chat_id = tk.StringVar(value=saved.get("zalo_group_chat_id", ""))
         self._alert_channel = self.alert_channel.get()
         self.onebss_user = tk.StringVar(value=saved.get("onebss_user", ""))
         self.onebss_password = tk.StringVar(value="")
@@ -310,7 +320,12 @@ class ATSApp(tk.Tk):
         self._alert_destination = self.destination.get()
         self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
         self._build_ui()
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        REMOTE_GUI_PID_PATH.write_text(str(os.getpid()), encoding="ascii")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(1500, self._check_remote_resume_request)
+        if self.remote_enabled.get():
+            self._start_remote_resume_supervisor()
         if self._zalo_token_for_alerts:
             self._start_zalo_registration_listener(self._zalo_token_for_alerts)
         if updater.can_self_update():
@@ -362,6 +377,12 @@ class ATSApp(tk.Tk):
         ttk.Label(box, text=f"Cấu hình Telegram được lưu riêng trên máy này: {SETTINGS_PATH}").grid(row=6, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
         ttk.Label(box, text="Zalo Bot token").grid(row=7, column=0, sticky="w", **pad)
         ttk.Entry(box, textvariable=self.zalo_token, show="*", width=42).grid(row=7, column=1, columnspan=3, sticky="ew", **pad)
+        ttk.Label(box, text="Zalo Group Chat ID").grid(row=8, column=0, sticky="w", **pad)
+        ttk.Entry(box, textvariable=self.zalo_group_chat_id).grid(row=8, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Button(box, text="Lấy Group ID Zalo", command=self._fetch_zalo_group_id).grid(row=8, column=3, sticky="ew", **pad)
+        ttk.Label(box, text="Thêm bot vào group; thành viên cần nhắc tên bot hoặc trả lời tin bot để app nhận diện group.").grid(
+            row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 6)
+        )
         box.columnconfigure(1, weight=1)
         box.columnconfigure(2, weight=1)
 
@@ -418,7 +439,11 @@ class ATSApp(tk.Tk):
             if self._alert_channel not in ("Telegram", "Zalo", "Cả hai"):
                 raise ValueError("Chọn kênh cảnh báo Telegram, Zalo hoặc Cả hai")
             need_telegram_staff = self._alert_channel in ("Telegram", "Cả hai") and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
-            need_zalo_staff = self._alert_channel in ("Zalo", "Cả hai")
+            use_zalo = self._alert_channel in ("Zalo", "Cả hai")
+            need_zalo_group = use_zalo and self._alert_destination in ("Group", "Cả hai")
+            need_zalo_staff = use_zalo and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
+            if need_zalo_group and not self.zalo_group_chat_id.get().strip():
+                raise ValueError("Nhập Zalo Group Chat ID hoặc bấm ‘Lấy Group ID Zalo’.")
             selected_staff_ids = None
             if need_telegram_staff or need_zalo_staff:
                 selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
@@ -436,10 +461,15 @@ class ATSApp(tk.Tk):
                 elif self._alert_channel == "Telegram":
                     duty_roster.recipients(duty_roster.load(ROSTER_PATH), duty_roster.load(CONTACTS_PATH))
                 if need_zalo_staff:
+                    missing_zalo = []
                     _zalo_duty_recipients(
                         duty_roster.load(ROSTER_PATH), duty_roster.load(ZALO_CONTACTS_PATH),
-                        staff_ids=selected_staff_ids,
+                        staff_ids=selected_staff_ids, allow_missing=True, missing_names=missing_zalo,
                     )
+                    if missing_zalo:
+                        warning = "Thiếu Zalo Chat ID (các nhân sự này sẽ bị bỏ qua khi gửi riêng): " + ", ".join(missing_zalo)
+                        self.write_log("Cảnh báo: " + warning)
+                        messagebox.showwarning("Thiếu Zalo Chat ID", warning + "\n\nVẫn cho phép chạy; cảnh báo Group Zalo vẫn được gửi.")
             user = self.onebss_user.get().strip()
             password = self.onebss_password.get()
             allowed = _parse_recipient_chat_ids(self.otp_chat_ids.get())
@@ -460,8 +490,10 @@ class ATSApp(tk.Tk):
             settings = _load_settings()
             settings.update(onebss_user=user, remote_login_enabled=self.remote_enabled.get(),
                             otp_chat_ids=self.otp_chat_ids.get(), otp_selector=self.otp_selector.get(),
+                            telegram_token=self.telegram_token.get().strip(),
                             alert_destination=self._alert_destination,
-                            alert_channel=self._alert_channel)
+                            alert_channel=self._alert_channel,
+                            zalo_group_chat_id=self.zalo_group_chat_id.get().strip())
             zalo_token = self.zalo_token.get().strip()
             if zalo_token:
                 credential_store.save_secret(ZALO_CREDENTIAL_SERVICE, "bot-token", zalo_token)
@@ -769,7 +801,13 @@ class ATSApp(tk.Tk):
         if use_telegram and self._alert_destination in ("Group", "Cả hai"):
             destinations.append(("telegram", os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"], None))
         need_telegram_staff = use_telegram and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
-        need_zalo_staff = use_zalo
+        need_zalo_group = use_zalo and self._alert_destination in ("Group", "Cả hai")
+        need_zalo_staff = use_zalo and self._alert_destination in ("Nhân sự trong ca", "Cả hai")
+        if need_zalo_group:
+            group_id = self.zalo_group_chat_id.get().strip()
+            if not group_id:
+                raise RuntimeError("Thiếu Zalo Group Chat ID; hãy cấu hình trong Thiết lập.")
+            destinations.append(("zalo", group_id, "zalo-group:" + group_id))
         if need_telegram_staff or need_zalo_staff:
             selected_labels = self.service_preferences.get("selected_staff_label_ids", [])
             known_labels = {str(item["staff_label_id"]) for item in catalog.get("staff_labels", [])}
@@ -785,10 +823,13 @@ class ATSApp(tk.Tk):
                 self.write_log("Không có nhân sự trong ca thuộc các nhãn đã chọn; bỏ qua tin nhắn riêng.")
             destinations.extend(("telegram", ident, ident) for ident in ids)
         if need_zalo_staff:
+            missing_zalo = []
             ids = _zalo_duty_recipients(
                 duty_roster.load(ROSTER_PATH), duty_roster.load(ZALO_CONTACTS_PATH),
-                staff_ids=staff_ids,
+                staff_ids=staff_ids, allow_missing=True, missing_names=missing_zalo,
             )
+            if missing_zalo:
+                self.write_log("Bỏ qua gửi riêng Zalo cho nhân sự chưa có Chat ID: " + ", ".join(missing_zalo))
             destinations.extend(("zalo", ident, "zalo:" + ident) for ident in ids)
         failures = []
         for channel, ident, state_recipient in destinations:
@@ -883,7 +924,56 @@ class ATSApp(tk.Tk):
         self._zalo_registration_stop.set()
         self.request_stop()
         self._release_keep_awake()
+        try:
+            if REMOTE_GUI_PID_PATH.read_text(encoding="ascii").strip() == str(os.getpid()):
+                REMOTE_GUI_PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
         self.destroy()
+
+    def _start_remote_resume_supervisor(self):
+        settings = _load_settings()
+        if (not settings.get("remote_login_enabled")
+                or not str(settings.get("telegram_token", "")).strip()
+                or not remote_resume._chat_ids(settings)):
+            return
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--resume-supervisor"]
+        else:
+            command = [sys.executable, str(ROOT / "app.py"), "--resume-supervisor"]
+        options = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+            "cwd": str(ROOT),
+        }
+        if sys.platform == "win32":
+            options["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            options["start_new_session"] = True
+        try:
+            subprocess.Popen(command, **options)
+        except OSError as exc:
+            self.write_log(f"Không khởi động được listener /resume: {exc}")
+
+    def _check_remote_resume_request(self):
+        try:
+            if not REMOTE_RESUME_REQUEST_PATH.exists():
+                return
+            if self.worker and self.worker.is_alive():
+                return
+            REMOTE_RESUME_REQUEST_PATH.unlink(missing_ok=True)
+            if not self.remote_enabled.get():
+                self.write_log("Bỏ qua /resume vì đăng nhập từ xa đang tắt.")
+                return
+            self.write_log("Đã nhận /resume; tự mở OneBSS và chạy lại quy trình.")
+            self.open_browser()
+        except OSError as exc:
+            self.write_log(f"Không xử lý được yêu cầu /resume: {exc}")
+        finally:
+            if self.winfo_exists():
+                self.after(1500, self._check_remote_resume_request)
 
     def _on_keep_awake_changed(self):
         """Persist the choice and apply it immediately during an active session."""
@@ -1165,6 +1255,7 @@ class ATSApp(tk.Tk):
         os.environ["TXL_TELEGRAM_GROUP_CHAT_ID"] = self.telegram_chat_id.get().strip()
         if self.mb_extended and not self._prepare_preview_config():
             return
+        self._start_remote_resume_supervisor()
         if self._error_recipient_ids and not self._telegram_token_for_alerts and self.alert_channel.get() != "Zalo":
             messagebox.showerror(
                 "Thiếu Telegram Bot token",
@@ -1173,6 +1264,10 @@ class ATSApp(tk.Tk):
             return
         self.stop_requested = False
         self.start_event = threading.Event()
+        APP_DATA.mkdir(parents=True, exist_ok=True)
+        REMOTE_WORKFLOW_STATE_PATH.write_text(
+            json.dumps({"pid": os.getpid(), "started_at": time.time()}), encoding="utf-8"
+        )
         self.start_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled")
         self._acquire_keep_awake()
@@ -1244,7 +1339,10 @@ class ATSApp(tk.Tk):
             return False
         zalo_token = self.zalo_token.get().strip()
         if use_zalo and not zalo_token:
-            messagebox.showerror("Thiếu cấu hình Zalo", "Nhập Zalo Bot token để gửi riêng cho nhân sự trực.")
+            messagebox.showerror("Thiếu cấu hình Zalo", "Nhập Zalo Bot token để gửi cảnh báo Zalo.")
+            return False
+        if use_zalo and self.destination.get() in ("Group", "Cả hai") and not self.zalo_group_chat_id.get().strip():
+            messagebox.showerror("Thiếu cấu hình Zalo", "Nhập Zalo Group Chat ID hoặc bấm ‘Lấy Group ID Zalo’.")
             return False
         try:
             error_recipient_ids = _parse_recipient_chat_ids(
@@ -1282,6 +1380,7 @@ class ATSApp(tk.Tk):
                 "telegram_chat_id": chat_id,
                 "alert_channel": channel,
                 "alert_destination": self.destination.get(),
+                "zalo_group_chat_id": self.zalo_group_chat_id.get().strip(),
                 "error_recipient_chat_ids": error_recipient_ids,
                 "schedule_enabled": self.auto_repeat,
                 "repeat_minutes": interval_minutes,
@@ -1407,12 +1506,72 @@ class ATSApp(tk.Tk):
         except (OSError, subprocess.SubprocessError):
             messagebox.showerror("Zalo Bot token", "Không lưu được token an toàn trên máy này.", parent=parent)
             return
+        self._zalo_token_for_alerts = token
+        self._start_zalo_registration_listener(token)
         self.write_log("Đang tìm người vừa nhắn tin riêng cho Zalo Bot...")
         threading.Thread(
             target=self._fetch_zalo_chats_worker,
             args=(token, staff_name, parent, refresh),
             daemon=True,
         ).start()
+
+    def _fetch_zalo_group_id(self):
+        token = self.zalo_token.get().strip()
+        if not token:
+            messagebox.showerror("Thiếu Zalo Bot token", "Nhập Zalo Bot token ở cửa sổ chính trước.")
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Zalo", "Hãy dừng quy trình trước khi lấy Group ID Zalo.")
+            return
+        self.fetch_chat_btn.configure(state="disabled")
+        self.write_log("Đang tìm group từ các tin nhắn có nhắc hoặc reply bot...")
+        threading.Thread(target=self._fetch_zalo_group_id_worker, args=(token,), daemon=True).start()
+
+    def _fetch_zalo_group_id_worker(self, token):
+        try:
+            updates = zalo_bot.fetch_updates(token)
+            self._process_zalo_registration_updates(updates)
+            groups = zalo_bot.group_chats_from_updates(updates)
+            self.after(0, lambda groups=groups: self._show_zalo_group_picker(groups))
+        except Exception as exc:
+            error_text = str(exc)
+            self.write_log(f"Không lấy được Group ID Zalo: {error_text}")
+            self.after(0, lambda error_text=error_text: messagebox.showerror("Lấy Group ID Zalo", error_text))
+        finally:
+            self.after(0, lambda: self.fetch_chat_btn.configure(state="normal"))
+
+    def _show_zalo_group_picker(self, groups):
+        if not groups:
+            messagebox.showinfo(
+                "Chưa tìm thấy group Zalo",
+                "Chưa có cập nhật group. Hãy thêm bot vào nhóm, sau đó nhắc tên bot hoặc reply một tin của bot trong nhóm rồi bấm ‘Lấy Group ID Zalo’ lại.",
+            )
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Chọn group Zalo")
+        dialog.transient(self)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Chọn group Zalo sẽ nhận cảnh báo:").pack(anchor="w", padx=10, pady=(10, 4))
+        listing = tk.Listbox(dialog, width=70, height=min(10, len(groups)))
+        listing.pack(fill="both", expand=True, padx=10, pady=4)
+        for group in groups:
+            listing.insert("end", f'{group["name"]} — {group["id"]}')
+        listing.selection_set(0)
+
+        def choose():
+            selected = listing.curselection()
+            if not selected:
+                messagebox.showwarning("Chưa chọn group", "Hãy chọn một group Zalo.", parent=dialog)
+                return
+            group = groups[selected[0]]
+            self.zalo_group_chat_id.set(group["id"])
+            self.write_log(f'Đã chọn group Zalo: {group["name"]} ({group["id"]}).')
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(buttons, text="Chọn", command=choose).pack(side="right")
+        ttk.Button(buttons, text="Hủy", command=dialog.destroy).pack(side="right", padx=5)
 
     def _fetch_zalo_chats_worker(self, token, staff_name, parent, refresh):
         try:
@@ -2014,6 +2173,10 @@ class ATSApp(tk.Tk):
                 self._send_workflow_error_alert(error_text)
             self.after(0, lambda error_text=error_text: messagebox.showerror(APP_NAME, error_text))
         finally:
+            try:
+                REMOTE_WORKFLOW_STATE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
             self.current_stage = "Đã dừng"
             self._remote_config = None
             self.after(0, self.progress.stop)
@@ -2619,6 +2782,9 @@ class ATSApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    if "--resume-supervisor" in sys.argv:
+        remote_resume.run_supervisor(APP_DATA)
+        raise SystemExit(0)
     # Used by the Windows build pipeline without opening a GUI or requiring
     # OneBSS/Telegram credentials.
     if "--self-test" in sys.argv:
@@ -2683,7 +2849,10 @@ if __name__ == "__main__":
             context.close()
             browser.close()
         raise SystemExit(0)
+    resume_on_start = "--resume" in sys.argv
     app = ATSApp()
+    if resume_on_start:
+        app.after(1200, app.open_browser)
     ready_file = os.getenv("TOMS_UPDATE_READY_FILE", "").strip()
     if ready_file:
         try:
