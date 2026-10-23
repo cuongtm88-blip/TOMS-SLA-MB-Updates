@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -250,6 +251,34 @@ def _parse_repeat_minutes(value):
     return minutes if 1 <= minutes <= 10080 else None
 
 
+def _parse_date_range(from_value, to_value):
+    try:
+        start = datetime.strptime(str(from_value).strip(), "%d/%m/%Y").date()
+        end = datetime.strptime(str(to_value).strip(), "%d/%m/%Y").date()
+    except ValueError as exc:
+        raise ValueError("Ngày phải đúng định dạng dd/mm/yyyy, ví dụ 23/10/2026.") from exc
+    if end < start:
+        raise ValueError("Ngày đến phải bằng hoặc sau ngày từ.")
+    return start, end
+
+
+def _date_range_for_cycle(start, end, anchor_date, current_date, auto_repeat):
+    """Keep the selected range for this run and slide it by elapsed midnights."""
+    offset = max(0, (current_date - anchor_date).days) if auto_repeat else 0
+    return start + timedelta(days=offset), end + timedelta(days=offset)
+
+
+def _search_wait_seconds(start, end):
+    """Allow ten minutes per selected calendar day, with a six-hour ceiling."""
+    days = (end - start).days + 1
+    return min(6 * 60 * 60, days * 10 * 60)
+
+
+def _seconds_until_next_midnight(now):
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(0.0, (midnight - now).total_seconds())
+
+
 class ATSApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -321,6 +350,10 @@ class ATSApp(tk.Tk):
         self.service_preferences = {key: saved[key] for key in ("service_filter_mode", "selected_service_ids", "selected_service_label_ids", "selected_staff_label_ids") if key in saved}
         self._remote_config = None
         self._alert_destination = self.destination.get()
+        self._cycle_date_start = None
+        self._cycle_date_end = None
+        self._cycle_date_anchor = None
+        self._search_wait_timeout_seconds = 10 * 60
         self.roster_month = tk.StringVar(value=time.strftime("%Y-%m"))
         self._build_ui()
         APP_DATA.mkdir(parents=True, exist_ok=True)
@@ -775,13 +808,10 @@ class ATSApp(tk.Tk):
 
     def _read_two_scopes(self, page):
         frames = []
-        today = time.strftime("%d/%m/%Y")
-        self.after(0, lambda: (self.from_date.set(today), self.to_date.set(today)))
+        self._refresh_cycle_dates(page)
         scope_count = len(SEARCH_SCOPES)
         for number, (units, provinces) in enumerate(SEARCH_SCOPES, 1):
             self._ensure_onebss_session_active(page)
-            self._fill_date(page, today, 0)
-            self._fill_date(page, today, 1)
             self._ensure_all_statuses(page)
             self._clear_tree_selections(page, 0)
             self._clear_tree_selections(page, 1)
@@ -1245,6 +1275,11 @@ class ATSApp(tk.Tk):
         self.auto_repeat = bool(self.schedule_enabled.get())
         self.repeat_seconds = interval_minutes * 60
         try:
+            self._capture_cycle_date_range()
+        except ValueError as exc:
+            messagebox.showerror("Khoảng ngày tìm kiếm", str(exc))
+            return
+        try:
             _save_settings({
                 **_load_settings(),
                 "schedule_enabled": self.auto_repeat,
@@ -1296,6 +1331,11 @@ class ATSApp(tk.Tk):
         if self.worker and self.worker.is_alive():
             if self.start_event:
                 if not self._apply_telegram_config():
+                    return
+                try:
+                    self._capture_cycle_date_range()
+                except ValueError as exc:
+                    messagebox.showerror("Khoảng ngày tìm kiếm", str(exc))
                     return
                 if (self._alert_channel in ("Telegram", "Cả hai")
                         and self._alert_destination in ("Group", "Cả hai")
@@ -2173,6 +2213,7 @@ class ATSApp(tk.Tk):
                 self.after(0, lambda: self.progress.start(10))
                 cycle = 1
                 while not self.stop_requested:
+                    cycle_started_on = datetime.now().date()
                     self.current_stage = f"Chu kỳ {cycle}: kiểm tra phiên OneBSS"
                     if self.mb_extended and self._onebss_session_expired(page):
                         self._reauthenticate(page)
@@ -2197,14 +2238,28 @@ class ATSApp(tk.Tk):
                     self.write_log("Hoàn tất quy trình.")
                     if not self.auto_repeat:
                         break
+                    if datetime.now().date() > cycle_started_on:
+                        self.write_log(
+                            "Chu kỳ vừa hoàn tất sau 0h; chạy ngay với khoảng ngày đã tiến thêm một ngày."
+                        )
+                        cycle += 1
+                        continue
                     interval_minutes = self.repeat_seconds // 60
                     self.write_log(
-                        f"Đã bật tự động: sẽ chạy lại sau {interval_minutes} phút, không cần bấm thêm nút."
+                        f"Đã bật tự động: sẽ chạy lại sau {interval_minutes} phút "
+                        "hoặc ngay khi sang ngày mới."
                     )
-                    for _ in range(self.repeat_seconds):
+                    repeat_deadline = time.monotonic() + self.repeat_seconds
+                    while not self.stop_requested:
+                        remaining = min(
+                            repeat_deadline - time.monotonic(),
+                            _seconds_until_next_midnight(datetime.now()),
+                        )
+                        if remaining <= 0:
+                            break
                         if self.stop_requested:
                             break
-                        time.sleep(1)
+                        time.sleep(min(1, remaining))
                     cycle += 1
                 self._close_browser_context(ctx)
                 self.browser_context, self.browser_page = None, None
@@ -2491,13 +2546,36 @@ class ATSApp(tk.Tk):
             pass
         raise RuntimeError(f'Không tìm thấy mục OneBSS: "{text}". Hãy kiểm tra đã đăng nhập và trang đã tải xong.')
 
+    def _capture_cycle_date_range(self):
+        start, end = _parse_date_range(self.from_date.get(), self.to_date.get())
+        self._cycle_date_start = start
+        self._cycle_date_end = end
+        self._cycle_date_anchor = datetime.now().date()
+        self._search_wait_timeout_seconds = _search_wait_seconds(start, end)
+
     def _refresh_cycle_dates(self, page):
-        """Apply today's date to OneBSS and keep the desktop UI in sync."""
-        today = time.strftime("%d/%m/%Y")
-        self.after(0, lambda: (self.from_date.set(today), self.to_date.set(today)))
-        self._fill_date(page, today, 0)
-        self._fill_date(page, today, 1)
-        return today
+        """Apply the selected range, sliding it after midnight in auto mode."""
+        if self._cycle_date_start is None or self._cycle_date_end is None:
+            self._capture_cycle_date_range()
+        today = datetime.now().date()
+        start, end = _date_range_for_cycle(
+            self._cycle_date_start,
+            self._cycle_date_end,
+            self._cycle_date_anchor or today,
+            today,
+            self.auto_repeat,
+        )
+        from_text = start.strftime("%d/%m/%Y")
+        to_text = end.strftime("%d/%m/%Y")
+        self._search_wait_timeout_seconds = _search_wait_seconds(start, end)
+        self.after(0, lambda: (self.from_date.set(from_text), self.to_date.set(to_text)))
+        self._fill_date(page, from_text, 0)
+        self._fill_date(page, to_text, 1)
+        self.write_log(
+            f"Khoảng ngày OneBSS: {from_text} – {to_text}; thời gian chờ tối đa "
+            f"{self._search_wait_timeout_seconds // 60} phút."
+        )
+        return from_text, to_text
 
     def _fill_date(self, page, value, index):
         inputs = page.locator('input.mx-input, input[type="date"], input[placeholder*="ngày"], input[placeholder*="Ngày"]')
@@ -2664,13 +2742,15 @@ class ATSApp(tk.Tk):
                         page, cycle, recovery_attempt
                     )
 
-    def _wait_for_search_complete(self, page, timeout_seconds=600):
+    def _wait_for_search_complete(self, page, timeout_seconds=None):
         """Wait until OneBSS finishes loading every record.
 
         OneBSS removes the ``disabled`` class from the "Dừng Xử lý" action
         while a search is running and restores it only after all pages have
         been loaded. Exporting before that transition produces a partial file.
         """
+        if timeout_seconds is None:
+            timeout_seconds = getattr(self, "_search_wait_timeout_seconds", 10 * 60)
         stop_control = page.get_by_text("Dừng Xử lý", exact=True).first
         stop_control.wait_for(state="visible", timeout=15000)
         deadline = time.monotonic() + timeout_seconds
