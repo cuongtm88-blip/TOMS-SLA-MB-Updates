@@ -84,6 +84,30 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(installation.iloc[0]["ten_nv"], "Nhân viên ngoài danh sách")
         self.assertEqual(set(installation["tentinh"].iloc[1:]), {"Tỉnh Thanh Hóa", "Tỉnh Nghệ An", "Tỉnh Hà Tĩnh"})
 
+    def test_selected_date_range_rolls_daily_only_in_auto_mode(self):
+        start, end = app._parse_date_range("20/10/2026", "23/10/2026")
+        anchor = datetime(2026, 10, 20).date()
+        self.assertEqual(
+            app._date_range_for_cycle(start, end, anchor, anchor, True),
+            (datetime(2026, 10, 20).date(), datetime(2026, 10, 23).date()),
+        )
+        next_day = datetime(2026, 10, 21).date()
+        self.assertEqual(
+            app._date_range_for_cycle(start, end, anchor, next_day, True),
+            (datetime(2026, 10, 21).date(), datetime(2026, 10, 24).date()),
+        )
+        self.assertEqual(
+            app._date_range_for_cycle(start, end, anchor, next_day, False),
+            (start, end),
+        )
+        self.assertEqual(app._search_wait_seconds(start, end), 40 * 60)
+        self.assertEqual(
+            app._seconds_until_next_midnight(datetime(2026, 10, 20, 23, 58)),
+            120,
+        )
+        with self.assertRaises(ValueError):
+            app._parse_date_range("24/10/2026", "23/10/2026")
+
     def test_roster_boundaries(self):
         rosters = {"2026-09": {"people": {"old": {"name": "Previous", "shifts": {"30": "Đêm"}}}},
                    "2026-10": {"people": {"day": {"name": "Day", "shifts": {"1": "HC"}},
