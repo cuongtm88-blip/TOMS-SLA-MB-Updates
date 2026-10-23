@@ -1,4 +1,4 @@
-# MB macOS — phiên bản 1.0.14
+# MB macOS — phiên bản 1.0.16
 
 Bản phát hành này dùng chung mã tính năng MB cho macOS và Windows. Bộ cài
 Windows và gói macOS được phát hành riêng trong cùng đợt.
